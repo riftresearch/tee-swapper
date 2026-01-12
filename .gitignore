@@ -1,0 +1,63 @@
+# dependencies (bun install)
+node_modules
+
+# output
+out
+dist
+*.tgz
+
+# code coverage
+coverage
+*.lcov
+
+# logs
+logs
+*.log
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# dotenv environment variable files
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache
+*.tsbuildinfo
+.turbo
+
+# IntelliJ based IDEs
+.idea
+
+# VS Code
+.vscode/
+
+# Finder (MacOS) folder config
+.DS_Store
+
+# Linux
+*~
+
+# Vim swap files
+*.swp
+*.swo
+
+# Test data (persistent PGlite database)
+test-data/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# SSL/TLS certificates and keys
+*.pem
+*.key
+*.crt
+
+# Debug files
+*.pid
+*.seed
+*.pid.lock

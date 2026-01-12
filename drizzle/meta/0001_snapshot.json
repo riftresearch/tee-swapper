@@ -1,0 +1,233 @@
+{
+  "id": "c3ad513e-f8dc-422d-b68c-2d5e803a06b7",
+  "prevId": "55cde785-14da-4900-9b69-5d56bf4af858",
+  "version": "7",
+  "dialect": "postgresql",
+  "tables": {
+    "public.swaps": {
+      "name": "swaps",
+      "schema": "",
+      "columns": {
+        "swap_id": {
+          "name": "swap_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "chain_id": {
+          "name": "chain_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "deposit_address": {
+          "name": "deposit_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "deposit_private_key": {
+          "name": "deposit_private_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "sell_token": {
+          "name": "sell_token",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "buy_token": {
+          "name": "buy_token",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expected_amount": {
+          "name": "expected_amount",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "recipient_address": {
+          "name": "recipient_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "refund_address": {
+          "name": "refund_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "status": {
+          "name": "status",
+          "type": "swap_status",
+          "typeSchema": "public",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'pending_deposit'"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "depositor_address": {
+          "name": "depositor_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deposit_tx_hash": {
+          "name": "deposit_tx_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "deposit_amount": {
+          "name": "deposit_amount",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "cow_order_uid": {
+          "name": "cow_order_uid",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "order_status": {
+          "name": "order_status",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "settlement_tx_hash": {
+          "name": "settlement_tx_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "actual_buy_amount": {
+          "name": "actual_buy_amount",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "failure_reason": {
+          "name": "failure_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "refund_tx_hash": {
+          "name": "refund_tx_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "refund_amount": {
+          "name": "refund_amount",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "idx_pending_by_chain": {
+          "name": "idx_pending_by_chain",
+          "columns": [
+            {
+              "expression": "chain_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "status",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_deposit_address": {
+          "name": "idx_deposit_address",
+          "columns": [
+            {
+              "expression": "deposit_address",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "swaps_deposit_address_unique": {
+          "name": "swaps_deposit_address_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "deposit_address"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    }
+  },
+  "enums": {
+    "public.swap_status": {
+      "name": "swap_status",
+      "schema": "public",
+      "values": [
+        "pending_deposit",
+        "executing",
+        "complete",
+        "failed",
+        "expired",
+        "refund_pending",
+        "refunded"
+      ]
+    }
+  },
+  "schemas": {},
+  "sequences": {},
+  "roles": {},
+  "policies": {},
+  "views": {},
+  "_meta": {
+    "columns": {},
+    "schemas": {},
+    "tables": {}
+  }
+}
