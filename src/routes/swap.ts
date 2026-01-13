@@ -1,7 +1,9 @@
 import { Elysia, t } from "elysia";
-import { createDepositWallet } from "../services/wallet";
+import { getAddress, isAddress } from "viem";
+import { createVaultWallet } from "../services/wallet";
 import { createSwap, getSwapById } from "../db/queries";
 import { getChainConfig, isSupportedChainId } from "../config/chains";
+import { CBBTC_ADDRESSES } from "../config/constants";
 import type {
   CreateSwapResponse,
   SupportedChainId,
@@ -10,21 +12,26 @@ import type {
 } from "../types";
 import { serializeToken, deserializeToken } from "../utils/token";
 
-function isValidAddress(address: string): address is `0x${string}` {
-  return /^0x[a-fA-F0-9]{40}$/.test(address);
+/**
+ * Validate and normalize an Ethereum address to checksummed format.
+ * Returns null if invalid, or the checksummed address if valid.
+ */
+function normalizeAddress(address: string): `0x${string}` | null {
+  if (!isAddress(address)) {
+    return null;
+  }
+  return getAddress(address);
 }
 
-// Token schema for validation
-const tokenSchema = t.Union([
-  t.Object({ type: t.Literal("native") }),
-  t.Object({ type: t.Literal("erc20"), address: t.String() }),
-]);
+// Token schemas for validation - supports ERC20 and native ETH
+const erc20TokenSchema = t.Object({ type: t.Literal("erc20"), address: t.String() });
+const etherTokenSchema = t.Object({ type: t.Literal("ether") });
+const tokenSchema = t.Union([erc20TokenSchema, etherTokenSchema]);
 
+// Request schema - sellToken is always CBBTC, amount is determined by deposit
 const createSwapRequestSchema = t.Object({
   chainId: t.Number(),
-  sellToken: tokenSchema,
   buyToken: tokenSchema,
-  sellAmount: t.String(),
   recipientAddress: t.String(),
   refundAddress: t.String(),
 });
@@ -34,7 +41,7 @@ export const swapRoutes = new Elysia({ prefix: "/swap" })
   .post(
     "/",
     async ({ body, set }) => {
-      const { chainId, sellToken, buyToken, sellAmount, recipientAddress, refundAddress } = body;
+      const { chainId, buyToken, recipientAddress, refundAddress } = body;
 
       // Validate chain ID
       if (!isSupportedChainId(chainId)) {
@@ -42,18 +49,40 @@ export const swapRoutes = new Elysia({ prefix: "/swap" })
         return { error: `Unsupported chain ID: ${chainId}` };
       }
 
-      // Cast to Token type (validated by schema)
-      const sellTokenTyped = sellToken as Token;
-      const buyTokenTyped = buyToken as Token;
+      // Get CBBTC address for this chain (the only supported input token)
+      const cbbtcAddress = CBBTC_ADDRESSES[chainId];
+      if (!cbbtcAddress) {
+        set.status = 400;
+        return { error: `CBBTC not supported on chain ${chainId}` };
+      }
 
-      // Validate recipient address format
-      if (!isValidAddress(recipientAddress)) {
+      // sellToken is always CBBTC
+      const sellTokenTyped: Token = { type: "erc20", address: cbbtcAddress };
+
+      // Handle buyToken - can be ERC20 or native ETH
+      let buyTokenTyped: Token;
+      if (buyToken.type === "ether") {
+        buyTokenTyped = { type: "ether" };
+      } else {
+        // Normalize and validate buyToken address for ERC20
+        const normalizedBuyTokenAddress = normalizeAddress(buyToken.address);
+        if (!normalizedBuyTokenAddress) {
+          set.status = 400;
+          return { error: "Invalid buyToken address" };
+        }
+        buyTokenTyped = { type: "erc20", address: normalizedBuyTokenAddress };
+      }
+
+      // Validate and normalize recipient address
+      const normalizedRecipient = normalizeAddress(recipientAddress);
+      if (!normalizedRecipient) {
         set.status = 400;
         return { error: "Invalid recipient address" };
       }
 
-      // Validate refund address format
-      if (!isValidAddress(refundAddress)) {
+      // Validate and normalize refund address
+      const normalizedRefund = normalizeAddress(refundAddress);
+      if (!normalizedRefund) {
         set.status = 400;
         return { error: "Invalid refund address" };
       }
@@ -62,8 +91,8 @@ export const swapRoutes = new Elysia({ prefix: "/swap" })
         // Get chain config for TTL
         const chainConfig = getChainConfig(chainId as SupportedChainId);
 
-        // Generate a new deposit wallet
-        const depositWallet = createDepositWallet();
+        // Generate a new vault wallet
+        const vaultWallet = createVaultWallet();
 
         // Generate swap ID (UUID v7 for time-ordered IDs)
         const swapId = Bun.randomUUIDv7();
@@ -74,27 +103,26 @@ export const swapRoutes = new Elysia({ prefix: "/swap" })
 
         // Create swap record in database
         // Tokens are serialized to JSON for storage
+        // All addresses are normalized to checksummed format
+        // Only the salt is stored - private key is derived at runtime
         const swap = await createSwap({
           swapId,
           chainId,
-          depositAddress: depositWallet.address,
-          depositPrivateKey: depositWallet.privateKey,
+          vaultAddress: vaultWallet.address,
+          vaultSalt: vaultWallet.salt,
           sellToken: serializeToken(sellTokenTyped),
           buyToken: serializeToken(buyTokenTyped),
-          expectedAmount: sellAmount,
-          recipientAddress,
-          refundAddress,
+          recipientAddress: normalizedRecipient,
+          refundAddress: normalizedRefund,
           status: "pending_deposit",
           expiresAt,
         });
 
         const response: CreateSwapResponse = {
           swapId: swap.swapId,
-          depositAddress: swap.depositAddress as `0x${string}`,
+          vaultAddress: swap.vaultAddress as `0x${string}`,
           chainId: swap.chainId as SupportedChainId,
-          sellToken: deserializeToken(swap.sellToken),
           buyToken: deserializeToken(swap.buyToken),
-          expectedAmount: swap.expectedAmount,
           recipientAddress: swap.recipientAddress as `0x${string}`,
           refundAddress: swap.refundAddress as `0x${string}`,
           expiresAt: swap.expiresAt.getTime(),
@@ -127,10 +155,8 @@ export const swapRoutes = new Elysia({ prefix: "/swap" })
       const response: SwapStatusResponse = {
         swapId: swap.swapId,
         chainId: swap.chainId as SupportedChainId,
-        depositAddress: swap.depositAddress as `0x${string}`,
-        sellToken: deserializeToken(swap.sellToken),
+        vaultAddress: swap.vaultAddress as `0x${string}`,
         buyToken: deserializeToken(swap.buyToken),
-        expectedAmount: swap.expectedAmount,
         recipientAddress: swap.recipientAddress as `0x${string}`,
         refundAddress: swap.refundAddress as `0x${string}`,
         status: swap.status,

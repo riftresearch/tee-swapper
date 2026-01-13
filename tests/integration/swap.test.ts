@@ -72,8 +72,7 @@ describe("Swap Routes", () => {
         method: "POST",
         body: {
           chainId: 1,
-          sellToken: fixtures.validSwapRequest.sellToken,
-          // missing other fields
+          // missing buyToken, recipientAddress, refundAddress
         },
       });
 
@@ -93,11 +92,9 @@ describe("Swap Routes", () => {
       const body = await parseJson<CreateSwapResponse>(response);
 
       expect(body.swapId).toBeDefined();
-      expect(body.depositAddress).toMatch(/^0x[a-fA-F0-9]{40}$/);
+      expect(body.vaultAddress).toMatch(/^0x[a-fA-F0-9]{40}$/);
       expect(body.chainId).toBe(fixtures.validSwapRequest.chainId);
-      expect(body.sellToken).toEqual(fixtures.validSwapRequest.sellToken);
       expect(body.buyToken).toEqual(fixtures.validSwapRequest.buyToken);
-      expect(body.expectedAmount).toBe(fixtures.validSwapRequest.sellAmount);
       expect(body.recipientAddress).toBe(fixtures.validSwapRequest.recipientAddress);
       expect(body.refundAddress).toBe(fixtures.validSwapRequest.refundAddress);
       expect(body.status).toBe("pending_deposit");
@@ -117,7 +114,7 @@ describe("Swap Routes", () => {
       const body1 = await parseJson<CreateSwapResponse>(response1);
       const body2 = await parseJson<CreateSwapResponse>(response2);
 
-      expect(body1.depositAddress).not.toBe(body2.depositAddress);
+      expect(body1.vaultAddress).not.toBe(body2.vaultAddress);
       expect(body1.swapId).not.toBe(body2.swapId);
     });
   });
@@ -142,7 +139,7 @@ describe("Swap Routes", () => {
 
       expect(body.swapId).toBe(swapId);
       expect(body.chainId).toBe(fixtures.validSwapRequest.chainId);
-      expect(body.depositAddress).toBe(createBody.depositAddress);
+      expect(body.vaultAddress).toBe(createBody.vaultAddress);
       expect(body.status).toBe("pending_deposit");
       expect(body.createdAt).toBeDefined();
       expect(body.expiresAt).toBeDefined();

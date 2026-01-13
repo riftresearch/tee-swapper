@@ -4,7 +4,7 @@
  *
  * This script:
  * 1. Scans all deposit vaults in the test database
- * 2. Checks balances of ETH, USDC, USDT on Base chain
+ * 2. Checks balances of CBBTC, USDC, USDT on Base chain
  * 3. Recovers any stuck funds back to the test wallet
  *
  * Usage:
@@ -12,6 +12,9 @@
  *   bun scripts/recover-funds.ts --limit 2          # Dry run - only process 2 vaults
  *   bun scripts/recover-funds.ts --execute          # Execute recovery for all vaults
  *   bun scripts/recover-funds.ts --execute --limit 1 # Execute recovery for 1 vault only
+ *
+ * Requires:
+ *   - SERVER_KEY_PATH env var pointing to the server master key file
  */
 
 import { PGlite } from "@electric-sql/pglite";
@@ -20,22 +23,29 @@ import {
   createWalletClient,
   http,
   formatUnits,
-  parseUnits,
   erc20Abi,
   type Address,
   type PublicClient,
   type WalletClient,
+  type Account,
 } from "viem";
 import { base } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
+import { KeyDerivationService } from "../src/services/key-derivation";
 
 // Configuration
 const DATA_DIR = "./test-data/pglite";
 const BASE_RPC_URL = process.env.BASE_RPC_URL || "https://base.drpc.org";
 const TEST_PRIVATE_KEY = process.env.TEST_PRIVATE_KEY;
+const SERVER_KEY_PATH = process.env.SERVER_KEY_PATH;
 
 // Base chain tokens
 const TOKENS = {
+  CBBTC: {
+    address: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as Address,
+    decimals: 8,
+    symbol: "CBBTC",
+  },
   USDC: {
     address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as Address,
     decimals: 6,
@@ -53,8 +63,8 @@ const ETH_TRANSFER_GAS = 21000n;
 const ERC20_TRANSFER_GAS = 65000n; // Typical ERC20 transfer gas
 
 interface VaultInfo {
-  depositAddress: Address;
-  depositPrivateKey: `0x${string}`;
+  vaultAddress: Address;
+  vaultSalt: `0x${string}`;
   swapId: string;
   status: string;
   chainId: number;
@@ -63,27 +73,36 @@ interface VaultInfo {
 interface VaultBalance {
   vault: VaultInfo;
   ethBalance: bigint;
+  cbbtcBalance: bigint;
   usdcBalance: bigint;
   usdtBalance: bigint;
 }
 
 interface RecoveryAction {
   vault: VaultInfo;
-  token: "ETH" | "USDC" | "USDT";
+  token: "ETH" | "CBBTC" | "USDC" | "USDT";
   amount: bigint;
   amountFormatted: string;
   needsGasFunding: boolean;
   gasFundingNeeded: bigint;
 }
 
+interface SwapRow {
+  vault_address: string;
+  vault_salt: string;
+  swap_id: string;
+  status: string;
+  chain_id: number;
+}
+
 async function getVaultsFromDatabase(): Promise<VaultInfo[]> {
   const client = new PGlite(DATA_DIR);
 
   try {
-    const result = await client.query(`
+    const result = await client.query<SwapRow>(`
       SELECT
-        deposit_address,
-        deposit_private_key,
+        vault_address,
+        vault_salt,
         swap_id,
         status,
         chain_id
@@ -91,12 +110,12 @@ async function getVaultsFromDatabase(): Promise<VaultInfo[]> {
       ORDER BY created_at DESC
     `);
 
-    return result.rows.map((row: Record<string, unknown>) => ({
-      depositAddress: row.deposit_address as Address,
-      depositPrivateKey: row.deposit_private_key as `0x${string}`,
-      swapId: row.swap_id as string,
-      status: row.status as string,
-      chainId: row.chain_id as number,
+    return result.rows.map((row) => ({
+      vaultAddress: row.vault_address as Address,
+      vaultSalt: row.vault_salt as `0x${string}`,
+      swapId: row.swap_id,
+      status: row.status,
+      chainId: row.chain_id,
     }));
   } finally {
     await client.close();
@@ -112,29 +131,36 @@ async function checkVaultBalances(
   for (const vault of vaults) {
     // Only check Base chain vaults (chainId 8453)
     if (vault.chainId !== 8453) {
-      console.log(`Skipping vault ${vault.depositAddress} - chain ${vault.chainId} not Base`);
+      console.log(`Skipping vault ${vault.vaultAddress} - chain ${vault.chainId} not Base`);
       continue;
     }
 
-    const [ethBalance, usdcBalance, usdtBalance] = await Promise.all([
-      publicClient.getBalance({ address: vault.depositAddress }),
+    const [ethBalance, cbbtcBalance, usdcBalance, usdtBalance] = await Promise.all([
+      publicClient.getBalance({ address: vault.vaultAddress }),
+      publicClient.readContract({
+        address: TOKENS.CBBTC.address,
+        abi: erc20Abi,
+        functionName: "balanceOf",
+        args: [vault.vaultAddress],
+      }) as Promise<bigint>,
       publicClient.readContract({
         address: TOKENS.USDC.address,
         abi: erc20Abi,
         functionName: "balanceOf",
-        args: [vault.depositAddress],
+        args: [vault.vaultAddress],
       }) as Promise<bigint>,
       publicClient.readContract({
         address: TOKENS.USDT.address,
         abi: erc20Abi,
         functionName: "balanceOf",
-        args: [vault.depositAddress],
+        args: [vault.vaultAddress],
       }) as Promise<bigint>,
     ]);
 
     balances.push({
       vault,
       ethBalance,
+      cbbtcBalance,
       usdcBalance,
       usdtBalance,
     });
@@ -149,17 +175,32 @@ function planRecoveryActions(
 ): RecoveryAction[] {
   const actions: RecoveryAction[] = [];
 
-  for (const { vault, ethBalance, usdcBalance, usdtBalance } of balances) {
+  for (const { vault, ethBalance, cbbtcBalance, usdcBalance, usdtBalance } of balances) {
     // Calculate gas costs using maxFeePerGas (worst case)
     const ethTransferCost = ETH_TRANSFER_GAS * maxFeePerGas;
     const erc20TransferCost = ERC20_TRANSFER_GAS * maxFeePerGas;
 
     // Calculate total gas needed for all ERC20 transfers in this vault
-    const numErc20Transfers = (usdcBalance > 0n ? 1n : 0n) + (usdtBalance > 0n ? 1n : 0n);
+    const numErc20Transfers =
+      (cbbtcBalance > 0n ? 1n : 0n) +
+      (usdcBalance > 0n ? 1n : 0n) +
+      (usdtBalance > 0n ? 1n : 0n);
     const totalErc20GasNeeded = erc20TransferCost * numErc20Transfers;
 
     const needsGasFunding = numErc20Transfers > 0n && ethBalance < totalErc20GasNeeded;
     const gasFundingNeeded = needsGasFunding ? totalErc20GasNeeded - ethBalance : 0n;
+
+    // Check CBBTC (primary token for this project)
+    if (cbbtcBalance > 0n) {
+      actions.push({
+        vault,
+        token: "CBBTC",
+        amount: cbbtcBalance,
+        amountFormatted: formatUnits(cbbtcBalance, TOKENS.CBBTC.decimals),
+        needsGasFunding,
+        gasFundingNeeded,
+      });
+    }
 
     // Check USDC
     if (usdcBalance > 0n) {
@@ -188,6 +229,7 @@ function planRecoveryActions(
     // Check ETH (only recover if value > gas cost, otherwise it's dust)
     // We recover ETH last because we might need it for ERC20 transfers
     const ethNeededForErc20 =
+      (cbbtcBalance > 0n ? erc20TransferCost : 0n) +
       (usdcBalance > 0n ? erc20TransferCost : 0n) +
       (usdtBalance > 0n ? erc20TransferCost : 0n);
     const ethRecoverable = ethBalance - ethNeededForErc20 - ethTransferCost;
@@ -212,9 +254,16 @@ function planRecoveryActions(
 async function executeRecovery(
   actions: RecoveryAction[],
   recoveryAddress: Address,
-  fundingWallet: WalletClient,
-  publicClient: PublicClient
+  fundingAccount: Account,
+  publicClient: PublicClient,
+  keyDerivationService: KeyDerivationService
 ): Promise<void> {
+  // Create wallet client for the funding account
+  const fundingWallet = createWalletClient({
+    account: fundingAccount,
+    chain: base,
+    transport: http(BASE_RPC_URL),
+  });
   // Get current EIP-1559 fee estimates from the network
   const fees = await publicClient.estimateFeesPerGas();
   const maxFeePerGas = fees.maxFeePerGas;
@@ -223,7 +272,7 @@ async function executeRecovery(
   // Group actions by vault to handle gas funding efficiently
   const vaultActions = new Map<string, RecoveryAction[]>();
   for (const action of actions) {
-    const key = action.vault.depositAddress;
+    const key = action.vault.vaultAddress;
     if (!vaultActions.has(key)) {
       vaultActions.set(key, []);
     }
@@ -260,8 +309,9 @@ async function executeRecovery(
       console.log(`  Vault balance after funding: ${formatUnits(vaultBalance, 18)} ETH`);
     }
 
-    // Create wallet client for the vault
-    const vaultAccount = privateKeyToAccount(vault.depositPrivateKey);
+    // Derive private key from salt and create wallet client for the vault
+    const { privateKey } = keyDerivationService.getVaultWallet(vault.vaultSalt);
+    const vaultAccount = privateKeyToAccount(privateKey);
     const vaultWallet = createWalletClient({
       account: vaultAccount,
       chain: base,
@@ -270,7 +320,9 @@ async function executeRecovery(
 
     // Execute ERC20 transfers first
     for (const action of vaultActionList.filter(a => a.token !== "ETH")) {
-      const tokenInfo = action.token === "USDC" ? TOKENS.USDC : TOKENS.USDT;
+      const tokenInfo =
+        action.token === "CBBTC" ? TOKENS.CBBTC :
+        action.token === "USDC" ? TOKENS.USDC : TOKENS.USDT;
       console.log(`  Transferring ${action.amountFormatted} ${action.token}...`);
 
       try {
@@ -381,9 +433,8 @@ async function main() {
 
   // Parse --limit N parameter
   const limitIndex = process.argv.findIndex(arg => arg === "--limit");
-  const limit = limitIndex !== -1 && process.argv[limitIndex + 1]
-    ? parseInt(process.argv[limitIndex + 1], 10)
-    : undefined;
+  const limitArg = limitIndex !== -1 ? process.argv[limitIndex + 1] : undefined;
+  const limit = limitArg !== undefined ? parseInt(limitArg, 10) : undefined;
 
   console.log("=".repeat(60));
   console.log("Deposit Vault Recovery Script");
@@ -401,6 +452,16 @@ async function main() {
     process.exit(1);
   }
 
+  if (!SERVER_KEY_PATH) {
+    console.error("ERROR: SERVER_KEY_PATH not set in environment");
+    console.error("Please set it in .env file (path to server master key file)");
+    process.exit(1);
+  }
+
+  // Initialize key derivation service
+  const keyDerivationService = new KeyDerivationService(SERVER_KEY_PATH);
+  console.log(`Server key loaded from: ${SERVER_KEY_PATH}`);
+
   // Set up clients
   const recoveryAccount = privateKeyToAccount(TEST_PRIVATE_KEY as `0x${string}`);
   const recoveryAddress = recoveryAccount.address;
@@ -410,12 +471,6 @@ async function main() {
   console.log();
 
   const publicClient = createPublicClient({
-    chain: base,
-    transport: http(BASE_RPC_URL),
-  });
-
-  const fundingWallet = createWalletClient({
-    account: recoveryAccount,
     chain: base,
     transport: http(BASE_RPC_URL),
   });
@@ -432,7 +487,7 @@ async function main() {
 
   // Filter to vaults with non-zero balances
   let vaultsWithFunds = balances.filter(
-    b => b.ethBalance > 0n || b.usdcBalance > 0n || b.usdtBalance > 0n
+    b => b.ethBalance > 0n || b.cbbtcBalance > 0n || b.usdcBalance > 0n || b.usdtBalance > 0n
   );
 
   if (vaultsWithFunds.length === 0) {
@@ -447,21 +502,24 @@ async function main() {
 
   // Display balances
   console.log("\n" + "=".repeat(60));
-  console.log(`Vaults with funds: ${vaultsWithFunds.length}${limit !== undefined ? ` (limited from ${balances.filter(b => b.ethBalance > 0n || b.usdcBalance > 0n || b.usdtBalance > 0n).length})` : ""}`);
+  console.log(`Vaults with funds: ${vaultsWithFunds.length}${limit !== undefined ? ` (limited from ${balances.filter(b => b.ethBalance > 0n || b.cbbtcBalance > 0n || b.usdcBalance > 0n || b.usdtBalance > 0n).length})` : ""}`);
   console.log("=".repeat(60));
 
-  for (const { vault, ethBalance, usdcBalance, usdtBalance } of vaultsWithFunds) {
-    console.log(`\nVault: ${vault.depositAddress}`);
+  for (const { vault, ethBalance, cbbtcBalance, usdcBalance, usdtBalance } of vaultsWithFunds) {
+    console.log(`\nVault: ${vault.vaultAddress}`);
     console.log(`  Swap ID: ${vault.swapId}`);
     console.log(`  Status: ${vault.status}`);
     if (ethBalance > 0n) {
-      console.log(`  ETH:  ${formatUnits(ethBalance, 18)}`);
+      console.log(`  ETH:   ${formatUnits(ethBalance, 18)}`);
+    }
+    if (cbbtcBalance > 0n) {
+      console.log(`  CBBTC: ${formatUnits(cbbtcBalance, 8)}`);
     }
     if (usdcBalance > 0n) {
-      console.log(`  USDC: ${formatUnits(usdcBalance, 6)}`);
+      console.log(`  USDC:  ${formatUnits(usdcBalance, 6)}`);
     }
     if (usdtBalance > 0n) {
-      console.log(`  USDT: ${formatUnits(usdtBalance, 6)}`);
+      console.log(`  USDT:  ${formatUnits(usdtBalance, 6)}`);
     }
   }
 
@@ -489,13 +547,13 @@ async function main() {
   const vaultGasFunding = new Map<string, bigint>();
   for (const action of actions) {
     console.log(`\n${action.token}: ${action.amountFormatted}`);
-    console.log(`  From: ${action.vault.depositAddress}`);
+    console.log(`  From: ${action.vault.vaultAddress}`);
     if (action.needsGasFunding) {
       console.log(`  ⚠ Needs gas funding: ${formatUnits(action.gasFundingNeeded, 18)} ETH`);
       // Only count once per vault (take max in case values differ)
-      const current = vaultGasFunding.get(action.vault.depositAddress) || 0n;
+      const current = vaultGasFunding.get(action.vault.vaultAddress) || 0n;
       if (action.gasFundingNeeded > current) {
-        vaultGasFunding.set(action.vault.depositAddress, action.gasFundingNeeded);
+        vaultGasFunding.set(action.vault.vaultAddress, action.gasFundingNeeded);
       }
     }
   }
@@ -534,8 +592,9 @@ async function main() {
   await executeRecovery(
     actions,
     recoveryAddress,
-    fundingWallet as WalletClient,
-    publicClient as PublicClient
+    recoveryAccount,
+    publicClient as PublicClient,
+    keyDerivationService
   );
 
   console.log("\n" + "=".repeat(60));

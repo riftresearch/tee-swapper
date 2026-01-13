@@ -4,12 +4,13 @@ import { chains } from "../config/chains";
 import {
   getPendingSwaps,
   markSwapExecuting,
-  markSwapFailedNeedsRefund,
+  markSwapFailed,
+  recordDeposit,
   saveOrderUid,
 } from "../db/queries";
 import { batchGetBalances } from "./multicall";
 import { executeSwap as executeSwapFlow } from "./executor";
-import { UnsupportedTokenError } from "./flows/legacy";
+import { recordCowswapError } from "./metrics";
 import type { Swap } from "../db/schema";
 import type { ChainConfig } from "../types";
 
@@ -38,16 +39,26 @@ function createChainClient(config: ChainConfig): PublicClient {
  *
  * This submits the order to COWSwap and saves the order UID.
  * The settlement poller will track the order until it's filled.
+ *
+ * If COWSwap rejects the order (e.g., amount too small), the swap is marked
+ * as failed and won't be retried. Funds remain in the vault for manual recovery.
+ *
+ * @param swap - The swap record
+ * @param balance - The actual CBBTC balance in the vault to swap
+ * @param client - Viem public client for the chain
  */
-async function executeSwap(swap: Swap, client: PublicClient): Promise<void> {
-  console.log(`[Poller] Executing swap ${swap.swapId} on chain ${swap.chainId}`);
+async function executeSwap(swap: Swap, balance: bigint, client: PublicClient): Promise<void> {
+  console.log(`[Poller] Executing swap ${swap.swapId} on chain ${swap.chainId}, amount: ${balance}`);
 
   try {
+    // Record the deposit amount
+    await recordDeposit(swap.swapId, "", "", balance.toString());
+
     // Mark as executing
     await markSwapExecuting(swap.swapId);
 
-    // Execute the swap using the appropriate flow (ETH, permit, or legacy)
-    const result = await executeSwapFlow(swap, client);
+    // Execute the swap using the permit flow with the actual balance
+    const result = await executeSwapFlow(swap, balance, client);
 
     console.log(`[Poller] Swap ${swap.swapId} order submitted: ${result.orderId}`);
 
@@ -62,22 +73,21 @@ async function executeSwap(swap: Swap, client: PublicClient): Promise<void> {
     console.error(`[Poller] Swap ${swap.swapId} failed:`, error);
 
     // Extract error message for storage
-    let failureReason: string;
-    if (error instanceof UnsupportedTokenError) {
-      failureReason = `Token requires hot wallet flow (not implemented): ${swap.sellToken}`;
-    } else if (error instanceof Error) {
-      failureReason = error.message;
-    } else {
-      failureReason = String(error);
-    }
+    const failureReason = error instanceof Error ? error.message : String(error);
 
-    // Since we got here after detecting a deposit, funds need to be refunded
-    await markSwapFailedNeedsRefund(swap.swapId, failureReason);
+    // Record COWSwap error metric (most failures are from quote/order submission)
+    recordCowswapError(swap.chainId, "createOrder");
+
+    // Mark as failed - won't be retried. Funds remain in vault for manual recovery.
+    await markSwapFailed(swap.swapId, failureReason);
   }
 }
 
 /**
  * Poll for pending swaps on a chain and execute funded ones
+ *
+ * Any non-zero balance triggers a swap attempt. If COWSwap rejects it
+ * (e.g., amount too small), the swap is marked as failed.
  */
 async function pollChain(config: ChainConfig, client: PublicClient): Promise<void> {
   try {
@@ -93,21 +103,18 @@ async function pollChain(config: ChainConfig, client: PublicClient): Promise<voi
     // Batch get all balances
     const balances = await batchGetBalances(client, pending);
 
-    // Process swaps that have sufficient balance
+    // Process swaps that have any balance
     for (let i = 0; i < pending.length; i++) {
       const swap = pending[i];
       const balance = balances[i];
-      
-      if (!swap || balance === undefined) continue;
-      
-      const expectedAmount = BigInt(swap.expectedAmount);
 
-      if (balance >= expectedAmount) {
-        console.log(
-          `[Poller] Swap ${swap.swapId} funded: ${balance} >= ${expectedAmount}`
-        );
+      if (!swap || balance === undefined) continue;
+
+      if (balance > 0n) {
+        console.log(`[Poller] Swap ${swap.swapId} has balance: ${balance}`);
         // Execute in background to not block other swaps
-        executeSwap(swap, client).catch((err) =>
+        // Pass the actual balance to swap the entire amount
+        executeSwap(swap, balance, client).catch((err) =>
           console.error(`[Poller] Error executing swap ${swap.swapId}:`, err)
         );
       }

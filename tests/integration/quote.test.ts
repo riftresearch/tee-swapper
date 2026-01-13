@@ -51,7 +51,6 @@ describe("Quote Routes", () => {
 
       expect(body.quoteId).toBeDefined();
       expect(body.chainId).toBe(fixtures.validQuoteRequest.chainId);
-      expect(body.sellToken).toEqual(fixtures.validQuoteRequest.sellToken);
       expect(body.buyToken).toEqual(fixtures.validQuoteRequest.buyToken);
       expect(body.sellAmount).toBeDefined();
       expect(body.buyAmountEstimate).toBeDefined();

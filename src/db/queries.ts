@@ -1,4 +1,4 @@
-import { and, eq, gt, lt } from "drizzle-orm";
+import { and, eq, gt, lt, sql } from "drizzle-orm";
 import { db } from "./client";
 import { swaps, type NewSwap, type Swap } from "./schema";
 import type { SwapStatus, CowOrderStatus } from "../types";
@@ -47,15 +47,15 @@ export async function getSwapById(swapId: string): Promise<Swap | undefined> {
 }
 
 /**
- * Get a swap by deposit address
+ * Get a swap by vault address
  */
-export async function getSwapByDepositAddress(
-  depositAddress: string
+export async function getSwapByVaultAddress(
+  vaultAddress: string
 ): Promise<Swap | undefined> {
   const results = await db
     .select()
     .from(swaps)
-    .where(eq(swaps.depositAddress, depositAddress))
+    .where(eq(swaps.vaultAddress, vaultAddress))
     .limit(1);
   return results[0];
 }
@@ -269,4 +269,31 @@ export async function updateCowOrderStatus(
   }
 
   await db.update(swaps).set(updates).where(eq(swaps.swapId, swapId));
+}
+
+// ============================================
+// Metrics Queries
+// ============================================
+
+/**
+ * Get counts of swaps grouped by status and chain
+ * Used for Prometheus metrics
+ */
+export async function getSwapCountsByStatusAndChain(): Promise<
+  Array<{ chainId: number; status: string; count: number }>
+> {
+  const results = await db
+    .select({
+      chainId: swaps.chainId,
+      status: swaps.status,
+      count: sql<number>`count(*)::int`,
+    })
+    .from(swaps)
+    .groupBy(swaps.chainId, swaps.status);
+
+  return results.map((r) => ({
+    chainId: r.chainId,
+    status: r.status,
+    count: r.count,
+  }));
 }

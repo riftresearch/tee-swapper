@@ -1,25 +1,22 @@
-import type { Token, TokenAddress } from "../types";
+import { type Token, type TokenAddress, NATIVE_ETH_ADDRESS, getTokenAddress } from "../types";
 
 /**
  * Serialize a Token to a string for database storage
- * - Native ETH: "native"
- * - ERC20: the address itself (0x...)
+ * ERC20 tokens are stored as their address
+ * Native ETH is stored as the sentinel address
  */
 export function serializeToken(token: Token): string {
-  if (token.type === "native") {
-    return "native";
-  }
-  return token.address;
+  return getTokenAddress(token);
 }
 
 /**
  * Deserialize a string from database to Token
- * - "native" -> { type: "native" }
- * - 0x... -> { type: "erc20", address: ... }
+ * Checks for native ETH sentinel address
  */
 export function deserializeToken(serialized: string): Token {
-  if (serialized === "native") {
-    return { type: "native" };
+  // Check if it's the native ETH sentinel address (case-insensitive)
+  if (serialized.toLowerCase() === NATIVE_ETH_ADDRESS.toLowerCase()) {
+    return { type: "ether" };
   }
   return { type: "erc20", address: serialized as TokenAddress };
 }

@@ -50,25 +50,22 @@ export async function parseJson<T>(response: Response): Promise<T> {
 
 /**
  * Test fixtures
+ * Note: sellToken is always CBBTC - not specified in API requests
+ * Note: sellAmount is determined by the actual deposit, not specified in swap requests
  */
 export const fixtures = {
   validSwapRequest: {
     chainId: 1,
-    sellToken: { type: "erc20" as const, address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" }, // USDC
     buyToken: { type: "erc20" as const, address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" }, // WETH
-    sellAmount: "1000000000", // 1000 USDC
     recipientAddress: "0x1234567890123456789012345678901234567890",
     refundAddress: "0x1234567890123456789012345678901234567890",
   },
 
   validQuoteRequest: {
     chainId: 1,
-    sellToken: { type: "erc20" as const, address: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48" }, // USDC
     buyToken: { type: "erc20" as const, address: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" }, // WETH
-    sellAmount: "1000000000", // 1000 USDC
+    sellAmount: "100000000", // 1 CBBTC (8 decimals)
   },
-
-  nativeEthToken: { type: "native" as const },
 
   invalidAddress: "0xinvalid",
   unsupportedChainId: 999,

@@ -1,5 +1,5 @@
 {
-  "id": "55cde785-14da-4900-9b69-5d56bf4af858",
+  "id": "d7d00244-2d57-4d90-9753-2eb422ebc31c",
   "prevId": "00000000-0000-0000-0000-000000000000",
   "version": "7",
   "dialect": "postgresql",
@@ -20,14 +20,14 @@
           "primaryKey": false,
           "notNull": true
         },
-        "deposit_address": {
-          "name": "deposit_address",
+        "vault_address": {
+          "name": "vault_address",
           "type": "text",
           "primaryKey": false,
           "notNull": true
         },
-        "deposit_private_key": {
-          "name": "deposit_private_key",
+        "vault_salt": {
+          "name": "vault_salt",
           "type": "text",
           "primaryKey": false,
           "notNull": true
@@ -40,12 +40,6 @@
         },
         "buy_token": {
           "name": "buy_token",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "expected_amount": {
-          "name": "expected_amount",
           "type": "text",
           "primaryKey": false,
           "notNull": true
@@ -125,6 +119,12 @@
           "primaryKey": false,
           "notNull": false
         },
+        "failure_reason": {
+          "name": "failure_reason",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "refund_tx_hash": {
           "name": "refund_tx_hash",
           "type": "text",
@@ -146,8 +146,8 @@
         }
       },
       "indexes": {
-        "idx_pending_by_chain": {
-          "name": "idx_pending_by_chain",
+        "idx_pending_by_chain_expires": {
+          "name": "idx_pending_by_chain_expires",
           "columns": [
             {
               "expression": "chain_id",
@@ -160,6 +160,12 @@
               "isExpression": false,
               "asc": true,
               "nulls": "last"
+            },
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
             }
           ],
           "isUnique": false,
@@ -167,11 +173,26 @@
           "method": "btree",
           "with": {}
         },
-        "idx_deposit_address": {
-          "name": "idx_deposit_address",
+        "idx_vault_address": {
+          "name": "idx_vault_address",
           "columns": [
             {
-              "expression": "deposit_address",
+              "expression": "vault_address",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_status": {
+          "name": "idx_status",
+          "columns": [
+            {
+              "expression": "status",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -186,11 +207,11 @@
       "foreignKeys": {},
       "compositePrimaryKeys": {},
       "uniqueConstraints": {
-        "swaps_deposit_address_unique": {
-          "name": "swaps_deposit_address_unique",
+        "swaps_vault_address_unique": {
+          "name": "swaps_vault_address_unique",
           "nullsNotDistinct": false,
           "columns": [
-            "deposit_address"
+            "vault_address"
           ]
         }
       },

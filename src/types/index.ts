@@ -4,35 +4,31 @@ export type SupportedChainId = 1 | 8453;
 // Token address type for ERC20 tokens
 export type TokenAddress = `0x${string}`;
 
+// Native ETH sentinel address used by COWSwap
+export const NATIVE_ETH_ADDRESS = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as TokenAddress;
+
 /**
- * Token specification - tagged union for type safety
+ * Token specification - supports ERC20 and native ETH
+ *
+ * For native ETH, use type: "ether" - the system will handle the sentinel address internally
  */
 export type Token =
-  | { type: "native" }
-  | { type: "erc20"; address: TokenAddress };
+  | { type: "erc20"; address: TokenAddress }
+  | { type: "ether" };  // Native ETH (uses sentinel address internally)
 
 /**
- * Type guard for native ETH token
+ * Check if a token is native ETH
  */
-export function isNativeToken(token: Token): token is { type: "native" } {
-  return token.type === "native";
+export function isEtherToken(token: Token): token is { type: "ether" } {
+  return token.type === "ether";
 }
 
 /**
- * Type guard for ERC20 token
- */
-export function isErc20Token(token: Token): token is { type: "erc20"; address: TokenAddress } {
-  return token.type === "erc20";
-}
-
-/**
- * Get the address from an ERC20 token, throws if native
+ * Get the address to use for a token in COWSwap API
+ * Returns the sentinel address for native ETH
  */
 export function getTokenAddress(token: Token): TokenAddress {
-  if (isNativeToken(token)) {
-    throw new Error("Cannot get address of native token");
-  }
-  return token.address;
+  return isEtherToken(token) ? NATIVE_ETH_ADDRESS : token.address;
 }
 
 // Swap status enum
@@ -56,19 +52,19 @@ export interface ChainConfig {
 }
 
 // API Request/Response types
+// Note: sellToken is always CBBTC - not specified in requests/responses
+
 export interface QuoteRequest {
   chainId: SupportedChainId;
-  sellToken: Token;
   buyToken: Token;
-  sellAmount: string;
+  sellAmount: string; // Amount of CBBTC to sell
 }
 
 export interface QuoteResponse {
   quoteId: string;
   chainId: SupportedChainId;
-  sellToken: Token;
   buyToken: Token;
-  sellAmount: string;
+  sellAmount: string; // Amount of CBBTC
   buyAmountEstimate: string;
   expiresAt: number;
   canFill: boolean;
@@ -76,20 +72,16 @@ export interface QuoteResponse {
 
 export interface CreateSwapRequest {
   chainId: SupportedChainId;
-  sellToken: Token;
   buyToken: Token;
-  sellAmount: string;
   recipientAddress: `0x${string}`;
   refundAddress: `0x${string}`;
 }
 
 export interface CreateSwapResponse {
   swapId: string;
-  depositAddress: `0x${string}`;
+  vaultAddress: `0x${string}`;
   chainId: SupportedChainId;
-  sellToken: Token;
   buyToken: Token;
-  expectedAmount: string;
   recipientAddress: `0x${string}`;
   refundAddress: `0x${string}`;
   expiresAt: number;
@@ -99,10 +91,8 @@ export interface CreateSwapResponse {
 export interface SwapStatusResponse {
   swapId: string;
   chainId: SupportedChainId;
-  depositAddress: `0x${string}`;
-  sellToken: Token;
+  vaultAddress: `0x${string}`;
   buyToken: Token;
-  expectedAmount: string;
   recipientAddress: `0x${string}`;
   refundAddress: `0x${string}`;
   status: SwapStatus;
@@ -130,11 +120,3 @@ export interface ExecutionResult {
   orderId: string;   // COWSwap order UID (56 bytes hex)
   buyAmount: string;
 }
-
-// Discriminated union for swap execution flows
-// Note: Permit detection is done dynamically in the permit flow
-// using @cowprotocol/permit-utils, not via static config
-export type SwapFlow =
-  | { type: "native_eth" }
-  | { type: "permit_erc20" }
-  | { type: "legacy_erc20" };

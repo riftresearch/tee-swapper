@@ -1,209 +1,205 @@
-import { type Address, type PublicClient, keccak256, stringToHex } from "viem";
-import { JsonRpcProvider } from "@ethersproject/providers";
-import { Wallet } from "@ethersproject/wallet";
-import { Eip2612PermitUtils } from "@1inch/permit-signed-approvals-utils";
 import {
-  generatePermitHook,
-  getTokenPermitInfo,
-  isSupportedPermitInfo,
-  type PermitHookData,
-  type PermitInfo,
-} from "@cowprotocol/permit-utils";
+  type Address,
+  type PublicClient,
+  keccak256,
+  stringToHex,
+  encodeFunctionData,
+  maxUint256,
+} from "viem";
+import { signTypedData } from "viem/accounts";
 import { stringifyDeterministic } from "@cowprotocol/sdk-app-data";
 import type { Swap } from "../../db/schema";
-import type { ExecutionResult, SupportedChainId, TokenAddress, Token } from "../../types";
-import { isNativeToken } from "../../types";
+import type { ExecutionResult, SupportedChainId, TokenAddress } from "../../types";
+import { getTokenAddress } from "../../types";
 import { deserializeToken } from "../../utils/token";
 import { createSwapOrderWithAppData, getQuote } from "../cowswap";
-import { GPV2_VAULT_RELAYER } from "../tokens";
+import { getVaultWalletFromSalt } from "../wallet";
+import { GPV2_VAULT_RELAYER } from "../../config/constants";
 import { chains } from "../../config/chains";
-
-// WETH addresses per chain - for converting native ETH buyToken to WETH for orders
-const WETH_BY_CHAIN: Record<SupportedChainId, TokenAddress> = {
-  1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as TokenAddress,
-  8453: "0x4200000000000000000000000000000000000006" as TokenAddress,
-};
+import { createPublicClient, http } from "viem";
+import { getSlippageTolerance, applySlippageToBuyAmount } from "../slippage";
 
 /**
- * Convert Token to TokenAddress for order submission
- * Native ETH is converted to WETH since COWSwap orders use WETH
+ * CBBTC permit configuration
+ * CBBTC uses standard EIP-2612 permits with version "2"
+ * (from FiatTokenV2 contract)
  */
-function tokenToOrderAddress(token: Token, chainId: SupportedChainId): TokenAddress {
-  if (isNativeToken(token)) {
-    return WETH_BY_CHAIN[chainId];
-  }
-  return token.address;
-}
+const CBBTC_PERMIT_CONFIG = {
+  name: "Coinbase Wrapped BTC",
+  version: "2",
+} as const;
 
 /**
- * Custom ProviderConnector that uses our wallet for signing
- * This implements the interface expected by @1inch/permit-signed-approvals-utils
+ * EIP-2612 Permit types for EIP-712 signing
  */
-class WalletProviderConnector {
-  private provider: JsonRpcProvider;
-  private wallet: Wallet;
-
-  constructor(provider: JsonRpcProvider, wallet: Wallet) {
-    this.provider = provider;
-    this.wallet = wallet.connect(provider);
-  }
-
-  contractEncodeABI(
-    abi: Array<{ name: string; type: string; inputs?: Array<{ name: string; type: string }> }>,
-    address: string | null,
-    methodName: string,
-    methodParams: unknown[]
-  ): string {
-    const { Contract } = require("@ethersproject/contracts");
-    const contract = new Contract(address || "", abi, this.provider);
-    return contract.interface.encodeFunctionData(methodName, methodParams);
-  }
-
-  async signTypedData(
-    _walletAddress: string,
-    typedData: { domain: object; types: Record<string, Array<{ name: string; type: string }>>; message: object },
-    _typedDataHash: string
-  ): Promise<string> {
-    // Remove EIP712Domain from types as ethers adds it automatically
-    const types: Record<string, Array<{ name: string; type: string }>> = {};
-    for (const key of Object.keys(typedData.types)) {
-      if (key !== "EIP712Domain") {
-        const typeArray = typedData.types[key];
-        if (typeArray) {
-          types[key] = typeArray;
-        }
-      }
-    }
-
-    return this.wallet._signTypedData(typedData.domain, types, typedData.message);
-  }
-
-  async ethCall(contractAddress: string, callData: string): Promise<string> {
-    return this.provider.call({
-      to: contractAddress,
-      data: callData,
-    });
-  }
-
-  decodeABIParameter<T>(type: string, hex: string): T {
-    const { defaultAbiCoder } = require("@ethersproject/abi");
-    return defaultAbiCoder.decode([type], hex)[0] as T;
-  }
-
-  decodeABIParameters<T>(types: Array<{ name: string; type: string }>, hex: string): T {
-    const { defaultAbiCoder } = require("@ethersproject/abi");
-    const decoded = defaultAbiCoder.decode(types, hex);
-    const result: Record<string, unknown> = {};
-    Object.keys(decoded).forEach((key) => {
-      const value = decoded[key];
-      // Convert BigNumber to hex string
-      if (value && typeof value === "object" && "_isBigNumber" in value) {
-        result[key] = value.toHexString();
-      } else {
-        result[key] = value;
-      }
-    });
-    return result as T;
-  }
-}
+const PERMIT_TYPES = {
+  Permit: [
+    { name: "owner", type: "address" },
+    { name: "spender", type: "address" },
+    { name: "value", type: "uint256" },
+    { name: "nonce", type: "uint256" },
+    { name: "deadline", type: "uint256" },
+  ],
+} as const;
 
 /**
- * Create provider and wallet for permit operations
+ * ABI for EIP-2612 permit functions
  */
-function createProviderAndWallet(
-  chainId: SupportedChainId,
-  privateKey: `0x${string}`
-): { provider: JsonRpcProvider; wallet: Wallet; connector: WalletProviderConnector } {
+const PERMIT_ABI = [
+  {
+    name: "permit",
+    type: "function",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+      { name: "value", type: "uint256" },
+      { name: "deadline", type: "uint256" },
+      { name: "v", type: "uint8" },
+      { name: "r", type: "bytes32" },
+      { name: "s", type: "bytes32" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    name: "nonces",
+    type: "function",
+    inputs: [{ name: "owner", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+] as const;
+
+/**
+ * Get a public client for the given chain
+ */
+function getPublicClient(chainId: SupportedChainId): PublicClient {
   const chainConfig = chains[chainId];
-  const provider = new JsonRpcProvider(chainConfig.rpcUrl);
-  const wallet = new Wallet(privateKey);
-  const connector = new WalletProviderConnector(provider, wallet);
-  return { provider, wallet: wallet.connect(provider), connector };
-}
-
-/**
- * Get permit info for a token, detecting if it supports permits
- */
-async function getPermitInfoForToken(
-  chainId: SupportedChainId,
-  tokenAddress: TokenAddress,
-  provider: JsonRpcProvider
-): Promise<PermitInfo | null> {
-  const result = await getTokenPermitInfo({
-    spender: GPV2_VAULT_RELAYER,
-    tokenAddress,
-    chainId,
-    provider,
+  return createPublicClient({
+    transport: http(chainConfig.rpcUrl),
   });
-
-  // Check if it's an error result
-  if ("error" in result) {
-    console.log(`[PermitFlow] Token ${tokenAddress} permit check failed: ${result.error}`);
-    return null;
-  }
-
-  if (!isSupportedPermitInfo(result)) {
-    console.log(`[PermitFlow] Token ${tokenAddress} does not support permits`);
-    return null;
-  }
-
-  return result;
 }
 
 /**
- * Generate permit hook using COW Protocol's permit-utils library
+ * Get the current nonce for an address on an EIP-2612 token
  */
-async function generatePermitHookData(
+async function getPermitNonce(
+  client: PublicClient,
+  tokenAddress: TokenAddress,
+  owner: Address
+): Promise<bigint> {
+  const nonce = await client.readContract({
+    address: tokenAddress as Address,
+    abi: PERMIT_ABI,
+    functionName: "nonces",
+    args: [owner],
+  });
+  return nonce;
+}
+
+/**
+ * Sign an EIP-2612 permit
+ */
+async function signPermit(
   chainId: SupportedChainId,
   tokenAddress: TokenAddress,
-  tokenName: string | undefined,
-  provider: JsonRpcProvider,
-  wallet: Wallet,
-  connector: WalletProviderConnector,
-  permitInfo: PermitInfo
-): Promise<PermitHookData> {
-  // Create permit utils instance with our custom connector
-  const eip2612Utils = new Eip2612PermitUtils(connector);
-
-  // Get current nonce
-  const nonce = await eip2612Utils.getTokenNonce(tokenAddress, wallet.address);
-
-  // Generate the permit hook
-  const hookData = await generatePermitHook({
-    inputToken: { address: tokenAddress, name: tokenName },
-    spender: GPV2_VAULT_RELAYER,
+  privateKey: `0x${string}`,
+  owner: Address,
+  spender: Address,
+  value: bigint,
+  nonce: bigint,
+  deadline: bigint
+): Promise<{ v: number; r: `0x${string}`; s: `0x${string}` }> {
+  const domain = {
+    name: CBBTC_PERMIT_CONFIG.name,
+    version: CBBTC_PERMIT_CONFIG.version,
     chainId,
-    permitInfo,
-    provider,
-    eip2612Utils,
-    account: wallet.address,
+    verifyingContract: tokenAddress as Address,
+  };
+
+  const message = {
+    owner,
+    spender,
+    value,
     nonce,
+    deadline,
+  };
+
+  const signature = await signTypedData({
+    privateKey,
+    domain,
+    types: PERMIT_TYPES,
+    primaryType: "Permit",
+    message,
   });
 
-  if (!hookData) {
-    throw new Error(`Failed to generate permit hook for token ${tokenAddress}`);
-  }
+  // Parse signature into r, s, v components
+  const r = `0x${signature.slice(2, 66)}` as `0x${string}`;
+  const s = `0x${signature.slice(66, 130)}` as `0x${string}`;
+  const v = parseInt(signature.slice(130, 132), 16);
 
-  return hookData;
+  return { v, r, s };
 }
 
 /**
- * Build appData with permit pre-hook
+ * Encode the permit function call
+ */
+function encodePermitCall(
+  owner: Address,
+  spender: Address,
+  value: bigint,
+  deadline: bigint,
+  v: number,
+  r: `0x${string}`,
+  s: `0x${string}`
+): `0x${string}` {
+  return encodeFunctionData({
+    abi: PERMIT_ABI,
+    functionName: "permit",
+    args: [owner, spender, value, deadline, v, r, s],
+  });
+}
+
+/**
+ * Build appData with permit pre-hook and auto slippage configuration
  *
- * This computes the appData hash locally without needing external APIs.
+ * COWSwap uses appData to include:
+ * - Pre-transaction hooks (like permits)
+ * - Order class (market vs limit)
+ * - Quote metadata including slippage settings
+ *
+ * Setting smartSlippage: true enables COWSwap's auto slippage feature
+ * where solvers can optimize execution within the slippage tolerance.
+ *
  * The appDataHex is the keccak256 hash of the deterministically-stringified JSON.
  */
 async function buildAppDataWithPermitHook(
-  hookData: PermitHookData
+  tokenAddress: TokenAddress,
+  permitCalldata: `0x${string}`,
+  slippageBps: number
 ): Promise<{ appDataHex: `0x${string}`; fullAppData: string }> {
-  // Build the appData document with the permit pre-hook
-  // Following COW Protocol appData schema v1.1.0
+  // Build the appData document following COW Protocol appData schema v1.1.0
   const appDataDoc = {
     version: "1.1.0",
     appCode: "Rift TEE Swapper",
     metadata: {
       hooks: {
-        pre: [hookData],
+        pre: [
+          {
+            target: tokenAddress,
+            callData: permitCalldata,
+            gasLimit: "80000", // Permit calls typically use ~50k gas
+          },
+        ],
+      },
+      // Mark this as a market order (vs limit order)
+      orderClass: {
+        orderClass: "market",
+      },
+      // Include slippage settings for auto slippage
+      quote: {
+        slippageBips: slippageBps,
+        smartSlippage: true,
       },
     },
   };
@@ -221,91 +217,122 @@ async function buildAppDataWithPermitHook(
 }
 
 /**
- * Execute a swap for an ERC-20 token with permit support
+ * Execute a swap for CBBTC using EIP-2612 permit
  *
- * This flow uses COW Protocol's permit-utils library to:
- * 1. Detect if the token supports permits (EIP-2612 or DAI-style)
- * 2. Sign the permit with our deposit wallet
- * 3. Generate the permit hook calldata
- * 4. Submit the order with the permit hook in appData
+ * This flow:
+ * 1. Gets the permit nonce for the vault wallet
+ * 2. Signs an EIP-2612 permit authorizing COW's vault relayer
+ * 3. Encodes the permit call as a pre-hook
+ * 4. Submits the order with the permit hook in appData
  * 5. The solver executes the permit before the swap
+ *
+ * @param swap - The swap record
+ * @param sellAmount - The actual amount of CBBTC to sell (vault balance)
+ * @param _client - Unused, kept for interface compatibility
  */
 export async function executePermitFlow(
   swap: Swap,
-  _permitConfig: unknown, // Deprecated - we now detect permit info dynamically
+  sellAmount: bigint,
   _client: PublicClient
 ): Promise<ExecutionResult> {
   const chainId = swap.chainId as SupportedChainId;
-  const privateKey = swap.depositPrivateKey as `0x${string}`;
+
+  // Derive the private key from the stored salt
+  const vaultWallet = getVaultWalletFromSalt(swap.vaultSalt as `0x${string}`);
+  const privateKey = vaultWallet.privateKey;
+  const vaultAddress = swap.vaultAddress as Address;
 
   // Deserialize tokens from DB storage
   const sellToken = deserializeToken(swap.sellToken);
   const buyToken = deserializeToken(swap.buyToken);
 
-  // Validate sellToken is an ERC20 (not native ETH)
-  // Native ETH cannot use the permit flow - it would go through EthFlow
-  if (isNativeToken(sellToken)) {
-    throw new Error("Cannot use permit flow for native ETH - use EthFlow instead");
-  }
-  const sellTokenAddress = sellToken.address;
-
-  // Convert buyToken to address for the order (native ETH -> WETH)
-  const buyTokenAddress = tokenToOrderAddress(buyToken, chainId);
+  // Get token addresses
+  // sellToken is always CBBTC (ERC20), buyToken can be ERC20 or native ETH
+  const sellTokenAddress = getTokenAddress(sellToken);
+  const buyTokenAddress = getTokenAddress(buyToken);
 
   console.log(`[PermitFlow] Starting permit flow for swap ${swap.swapId}`);
+  console.log(`[PermitFlow] Vault wallet: ${vaultAddress}, amount: ${sellAmount}`);
 
-  // Create provider with our wallet
-  const { provider, wallet, connector } = createProviderAndWallet(chainId, privateKey);
+  // Create public client for reading nonce
+  const publicClient = getPublicClient(chainId);
 
-  console.log(`[PermitFlow] Deposit wallet: ${wallet.address}`);
+  // Get the current nonce
+  const nonce = await getPermitNonce(publicClient, sellTokenAddress, vaultAddress);
+  console.log(`[PermitFlow] Current nonce: ${nonce}`);
 
-  // Get permit info for the token
-  const permitInfo = await getPermitInfoForToken(chainId, sellTokenAddress, provider);
+  // Set deadline to max uint256 (never expires)
+  const deadline = maxUint256;
 
-  if (!permitInfo) {
-    throw new Error(`Token ${sellTokenAddress} does not support permits`);
-  }
+  // Value to approve - use max uint256 for unlimited approval
+  const value = maxUint256;
 
-  console.log(`[PermitFlow] Token supports ${permitInfo.type} permits (name: ${permitInfo.name}, version: ${permitInfo.version})`);
-
-  // Generate the permit hook
-  const hookData = await generatePermitHookData(
+  // Sign the permit
+  const { v, r, s } = await signPermit(
     chainId,
     sellTokenAddress,
-    permitInfo.name,
-    provider,
-    wallet,
-    connector,
-    permitInfo
+    privateKey,
+    vaultAddress,
+    GPV2_VAULT_RELAYER as Address,
+    value,
+    nonce,
+    deadline
   );
 
-  console.log(`[PermitFlow] Generated permit hook: target=${hookData.target}, gasLimit=${hookData.gasLimit}`);
+  console.log(`[PermitFlow] Permit signed (v=${v})`);
 
-  // Build appData with the permit hook
-  const { appDataHex, fullAppData } = await buildAppDataWithPermitHook(hookData);
+  // Encode the permit call
+  const permitCalldata = encodePermitCall(
+    vaultAddress,
+    GPV2_VAULT_RELAYER as Address,
+    value,
+    deadline,
+    v,
+    r,
+    s
+  );
+
+  console.log(`[PermitFlow] Permit calldata: ${permitCalldata.slice(0, 66)}...`);
+
+  // Fetch recommended slippage tolerance for this market
+  const slippageBps = await getSlippageTolerance(
+    chainId,
+    sellTokenAddress,
+    buyTokenAddress
+  );
+  console.log(`[PermitFlow] Using slippage tolerance: ${slippageBps} bps (${slippageBps / 100}%)`);
+
+  // Build appData with the permit hook and slippage settings
+  const { appDataHex, fullAppData } = await buildAppDataWithPermitHook(
+    sellTokenAddress,
+    permitCalldata,
+    slippageBps
+  );
 
   console.log(`[PermitFlow] AppData hash: ${appDataHex}`);
 
-  // Get a fresh quote
-  // Note: getQuote accepts Token and converts native ETH to WETH internally
+  // Get a fresh quote for the actual deposited amount
   const quote = await getQuote({
     chainId,
-    sellToken, // Pass Token object - getQuote handles conversion
-    buyToken,  // Pass Token object - getQuote handles conversion
-    sellAmount: swap.expectedAmount,
-    from: swap.depositAddress as Address,
+    sellToken,
+    buyToken,
+    sellAmount: sellAmount.toString(),
+    from: vaultAddress,
   });
 
+  // Apply slippage to get minimum acceptable buy amount
+  const buyAmountMin = applySlippageToBuyAmount(quote.buyAmount, slippageBps);
+  console.log(`[PermitFlow] Quote buyAmount: ${quote.buyAmount}, after slippage: ${buyAmountMin}`);
+
   // Create and submit the swap order with the permit hook in appData
-  // Note: Order uses WETH address for buyToken if user wanted ETH
   const order = await createSwapOrderWithAppData({
     chainId,
     sellToken: sellTokenAddress,
-    buyToken: buyTokenAddress, // Use WETH if buyToken was "ETH"
+    buyToken: buyTokenAddress,
     sellAmount: quote.sellAmount,
-    buyAmountMin: quote.buyAmount,
+    buyAmountMin,
     receiver: swap.recipientAddress as Address,
-    depositPrivateKey: privateKey,
+    vaultPrivateKey: privateKey,
     appDataHex,
     fullAppData,
   });

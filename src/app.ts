@@ -2,6 +2,7 @@ import { Elysia } from "elysia";
 import { healthRoutes } from "./routes/health";
 import { quoteRoutes } from "./routes/quote";
 import { swapRoutes } from "./routes/swap";
+import { metricsRoutes } from "./routes/metrics";
 
 /**
  * Create the Elysia app instance.
@@ -23,6 +24,8 @@ export function createApp() {
       set.status = 500;
       return { error: "Internal server error" };
     })
+    // Metrics first so middleware applies to all routes
+    .use(metricsRoutes)
     .use(healthRoutes)
     .use(quoteRoutes)
     .use(swapRoutes);

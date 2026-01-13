@@ -13,9 +13,14 @@ import { drizzle, type PgliteDatabase } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import * as schema from "../../src/db/schema";
 import { setDb, type Database } from "../../src/db/client";
-import { mkdirSync } from "fs";
+import { KeyDerivationService, setKeyDerivationService } from "../../src/services/key-derivation";
+import { mkdirSync, writeFileSync, existsSync } from "fs";
 
 const DATA_DIR = "./test-data/pglite";
+const TEST_KEY_PATH = "./test-data/test-server-key.txt";
+
+// Deterministic test key for reproducible tests
+const TEST_SERVER_KEY = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
 
 let pgliteClient: PGlite | null = null;
 let testDb: PgliteDatabase<typeof schema> | null = null;
@@ -27,6 +32,13 @@ let testDb: PgliteDatabase<typeof schema> | null = null;
 export async function setupPersistentTestDatabase(): Promise<PgliteDatabase<typeof schema>> {
   // Ensure data directory exists
   mkdirSync(DATA_DIR, { recursive: true });
+
+  // Create test server key file
+  writeFileSync(TEST_KEY_PATH, TEST_SERVER_KEY);
+
+  // Initialize the key derivation service with the test key
+  const keyService = new KeyDerivationService(TEST_KEY_PATH);
+  setKeyDerivationService(keyService);
 
   // Create persistent PostgreSQL instance
   pgliteClient = new PGlite(DATA_DIR);

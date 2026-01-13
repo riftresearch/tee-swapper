@@ -1,18 +1,18 @@
 import { Elysia, t } from "elysia";
-import { getQuote, canFillQuote } from "../services/cowswap";
-import { createDepositWallet } from "../services/wallet";
+import { getQuote } from "../services/cowswap";
+import { createVaultWallet } from "../services/wallet";
 import { isSupportedChainId } from "../config/chains";
-import type { QuoteResponse, SupportedChainId, Token, TokenAddress } from "../types";
+import { CBBTC_ADDRESSES } from "../config/constants";
+import type { QuoteResponse, SupportedChainId, Token } from "../types";
 
-// Token schema for validation
-const tokenSchema = t.Union([
-  t.Object({ type: t.Literal("native") }),
-  t.Object({ type: t.Literal("erc20"), address: t.String() }),
-]);
+// Token schemas for validation - supports ERC20 and native ETH
+const erc20TokenSchema = t.Object({ type: t.Literal("erc20"), address: t.String() });
+const etherTokenSchema = t.Object({ type: t.Literal("ether") });
+const tokenSchema = t.Union([erc20TokenSchema, etherTokenSchema]);
 
+// Request schema - sellToken is always CBBTC (not specified by caller)
 const quoteRequestSchema = t.Object({
   chainId: t.Number(),
-  sellToken: tokenSchema,
   buyToken: tokenSchema,
   sellAmount: t.String(),
 });
@@ -20,7 +20,7 @@ const quoteRequestSchema = t.Object({
 export const quoteRoutes = new Elysia({ prefix: "/quote" }).post(
   "/",
   async ({ body, set }) => {
-    const { chainId, sellToken, buyToken, sellAmount } = body;
+    const { chainId, buyToken, sellAmount } = body;
 
     // Validate chain ID
     if (!isSupportedChainId(chainId)) {
@@ -28,13 +28,21 @@ export const quoteRoutes = new Elysia({ prefix: "/quote" }).post(
       return { error: `Unsupported chain ID: ${chainId}` };
     }
 
-    // Cast to Token type (validated by schema)
-    const sellTokenTyped = sellToken as Token;
+    // Get CBBTC address for this chain (the only supported input token)
+    const cbbtcAddress = CBBTC_ADDRESSES[chainId];
+    if (!cbbtcAddress) {
+      set.status = 400;
+      return { error: `CBBTC not supported on chain ${chainId}` };
+    }
+
+    // sellToken is always CBBTC
+    const sellTokenTyped: Token = { type: "erc20", address: cbbtcAddress };
     const buyTokenTyped = buyToken as Token;
 
+    // Create a temporary wallet for the quote (we need a "from" address)
+    const tempWallet = createVaultWallet();
+
     try {
-      // Create a temporary wallet for the quote (we need a "from" address)
-      const tempWallet = createDepositWallet();
 
       // Get quote from COW Protocol
       const quote = await getQuote({
@@ -48,7 +56,6 @@ export const quoteRoutes = new Elysia({ prefix: "/quote" }).post(
       const response: QuoteResponse = {
         quoteId: quote.quoteId,
         chainId: chainId as SupportedChainId,
-        sellToken: sellTokenTyped,
         buyToken: buyTokenTyped,
         sellAmount: quote.sellAmount,
         buyAmountEstimate: quote.buyAmount,
@@ -60,26 +67,16 @@ export const quoteRoutes = new Elysia({ prefix: "/quote" }).post(
     } catch (error) {
       console.error("[Quote] Error getting quote:", error);
 
-      // Check if we can fill at all
-      const tempWallet2 = createDepositWallet();
-      const canFill = await canFillQuote({
-        chainId: chainId as SupportedChainId,
-        sellToken: sellTokenTyped,
-        buyToken: buyTokenTyped,
-        sellAmount,
-        from: tempWallet2.address,
-      });
+      // Extract error message from COWSwap
+      const errorMessage = error instanceof Error ? error.message : String(error);
 
-      if (!canFill) {
-        set.status = 400;
-        return {
-          error: "Cannot fill this swap request",
-          canFill: false,
-        };
-      }
-
-      set.status = 500;
-      return { error: "Failed to get quote" };
+      // Return 400 with the actual error from COWSwap
+      // Common errors: "SellAmountDoesNotCoverFee", "NoLiquidity", etc.
+      set.status = 400;
+      return {
+        error: errorMessage,
+        canFill: false,
+      };
     }
   },
   {

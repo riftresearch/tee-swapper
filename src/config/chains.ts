@@ -10,7 +10,7 @@ export const chains: Record<SupportedChainId, ChainConfig> = {
     rpcUrl: process.env.ETH_RPC_URL || "https://eth.drpc.org",
     multicall3: MULTICALL3_ADDRESS,
     pollingIntervalMs: 24_000, // ~2 blocks on Ethereum
-    swapTtlMs: 60 * 60 * 1000, // 1 hour
+    swapTtlMs: 12 * 60 * 60 * 1000, // 12 hours
   },
   8453: {
     chainId: 8453,
@@ -18,7 +18,7 @@ export const chains: Record<SupportedChainId, ChainConfig> = {
     rpcUrl: process.env.BASE_RPC_URL || "https://base.drpc.org",
     multicall3: MULTICALL3_ADDRESS,
     pollingIntervalMs: 10_000, // ~5 block on Base
-    swapTtlMs: 60 * 60 * 1000, // 1 hour
+    swapTtlMs: 12 * 60 * 60 * 1000, // 12 hours
   },
 };
 

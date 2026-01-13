@@ -1,1 +1,0 @@
-ALTER TABLE "swaps" ADD COLUMN "failure_reason" text;

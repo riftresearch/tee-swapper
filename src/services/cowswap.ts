@@ -4,14 +4,15 @@ import {
   SupportedChainId as CowChainId,
   OrderKind,
   SigningScheme,
+  SellTokenSource,
+  BuyTokenDestination,
   type OrderQuoteRequest,
   type OrderQuoteResponse,
-  type UnsignedOrder,
 } from "@cowprotocol/cow-sdk";
 import { type Address } from "viem";
 import { signTypedData } from "viem/accounts";
 import type { SupportedChainId, TokenAddress, CowOrderStatus, Token } from "../types";
-import { isNativeToken } from "../types";
+import { getTokenAddress } from "../types";
 import { getAccountFromPrivateKey } from "./wallet";
 import { ORDER_VALIDITY_SECONDS } from "../config/constants";
 
@@ -46,22 +47,27 @@ const COW_ORDER_TYPES = {
   ],
 } as const;
 
-// WETH addresses per chain - COWSwap quotes require WETH, not native ETH
-const WETH_BY_CHAIN: Record<SupportedChainId, TokenAddress> = {
-  1: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2" as TokenAddress,
-  8453: "0x4200000000000000000000000000000000000006" as TokenAddress,
-};
+// Type for EIP712 order message (used for signing)
+interface OrderMessage {
+  sellToken: Address;
+  buyToken: Address;
+  receiver: Address;
+  sellAmount: string;
+  buyAmount: string;
+  validTo: number;
+  appData: `0x${string}`;
+  feeAmount: string;
+  kind: string;
+  partiallyFillable: boolean;
+  sellTokenBalance: string;
+  buyTokenBalance: string;
+}
 
 /**
- * Convert Token to TokenAddress for COWSwap API
- * - native ETH -> WETH address (COWSwap doesn't accept native ETH)
- * - ERC20 -> pass through address
+ * Get token address from Token - supports ERC20 and native ETH
  */
-function tokenToAddress(token: Token, chainId: SupportedChainId): TokenAddress {
-  if (isNativeToken(token)) {
-    return WETH_BY_CHAIN[chainId];
-  }
-  return token.address;
+function tokenToAddress(token: Token): TokenAddress {
+  return getTokenAddress(token);
 }
 
 function getOrderValidTo(): number {
@@ -108,9 +114,9 @@ export interface QuoteResult {
 export async function getQuote(params: QuoteParams): Promise<QuoteResult> {
   const orderBookApi = getOrderBookApi(params.chainId);
 
-  // Convert tokens to addresses - "ETH" becomes WETH for COWSwap API
-  const sellTokenAddress = tokenToAddress(params.sellToken, params.chainId);
-  const buyTokenAddress = tokenToAddress(params.buyToken, params.chainId);
+  // Convert tokens to addresses
+  const sellTokenAddress = tokenToAddress(params.sellToken);
+  const buyTokenAddress = tokenToAddress(params.buyToken);
 
   const quoteRequest: OrderQuoteRequest = {
     sellToken: sellTokenAddress,
@@ -140,7 +146,7 @@ export interface SwapOrderParams {
   sellAmount: string;
   buyAmountMin: string;
   receiver: Address;
-  depositPrivateKey: `0x${string}`;
+  vaultPrivateKey: `0x${string}`;
   // validTo is intentionally omitted - we use MAX_VALID_TO so orders never expire
 }
 
@@ -162,37 +168,52 @@ export async function createSwapOrder(
   const orderBookApi = getOrderBookApi(params.chainId);
 
   // Get the account from the deposit wallet's private key
-  const account = getAccountFromPrivateKey(params.depositPrivateKey);
+  const account = getAccountFromPrivateKey(params.vaultPrivateKey);
 
-  // Create the unsigned order - valid for 24 hours
-  // Include sellTokenBalance and buyTokenBalance for EIP712 signing
-  const order: UnsignedOrder & { sellTokenBalance: string; buyTokenBalance: string } = {
-    sellToken: params.sellToken,
-    buyToken: params.buyToken,
+  const validTo = getOrderValidTo();
+  const appData = "0x0000000000000000000000000000000000000000000000000000000000000000" as const;
+
+  // Create the order message for EIP712 signing
+  const orderMessage: OrderMessage = {
+    sellToken: params.sellToken as Address,
+    buyToken: params.buyToken as Address,
+    receiver: params.receiver,
     sellAmount: params.sellAmount,
     buyAmount: params.buyAmountMin,
-    receiver: params.receiver,
-    validTo: getOrderValidTo(),
-    appData: "0x0000000000000000000000000000000000000000000000000000000000000000",
-    feeAmount: "0", // Fee is taken from sellAmount in modern COW
+    validTo,
+    appData,
+    feeAmount: "0",
     kind: OrderKind.SELL,
     partiallyFillable: false,
-    sellTokenBalance: "erc20",
-    buyTokenBalance: "erc20",
+    sellTokenBalance: SellTokenSource.ERC20,
+    buyTokenBalance: BuyTokenDestination.ERC20,
   };
 
   // Sign the order using viem directly with EIP712
+  // Cast message to any because viem's types are stricter than what EIP712 actually requires
   const signature = await signTypedData({
-    privateKey: params.depositPrivateKey,
+    privateKey: params.vaultPrivateKey,
     domain: getCowDomain(params.chainId),
     types: COW_ORDER_TYPES,
     primaryType: "Order",
-    message: order,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    message: orderMessage as any,
   });
 
   // Submit the order
   const orderId = await orderBookApi.sendOrder({
-    ...order,
+    sellToken: params.sellToken,
+    buyToken: params.buyToken,
+    receiver: params.receiver,
+    sellAmount: params.sellAmount,
+    buyAmount: params.buyAmountMin,
+    validTo,
+    appData,
+    feeAmount: "0",
+    kind: OrderKind.SELL,
+    partiallyFillable: false,
+    sellTokenBalance: SellTokenSource.ERC20,
+    buyTokenBalance: BuyTokenDestination.ERC20,
     signature,
     signingScheme: SigningScheme.EIP712,
     from: account.address,
@@ -215,32 +236,35 @@ export async function createSwapOrderWithAppData(
   const orderBookApi = getOrderBookApi(params.chainId);
 
   // Get the account from the deposit wallet's private key
-  const account = getAccountFromPrivateKey(params.depositPrivateKey);
+  const account = getAccountFromPrivateKey(params.vaultPrivateKey);
 
-  // Create the unsigned order with custom appData - valid for 24 hours
-  // Include sellTokenBalance and buyTokenBalance for EIP712 signing
-  const order: UnsignedOrder & { sellTokenBalance: string; buyTokenBalance: string } = {
-    sellToken: params.sellToken,
-    buyToken: params.buyToken,
+  const validTo = getOrderValidTo();
+
+  // Create the order message for EIP712 signing
+  const orderMessage: OrderMessage = {
+    sellToken: params.sellToken as Address,
+    buyToken: params.buyToken as Address,
+    receiver: params.receiver,
     sellAmount: params.sellAmount,
     buyAmount: params.buyAmountMin,
-    receiver: params.receiver,
-    validTo: getOrderValidTo(),
+    validTo,
     appData: params.appDataHex,
-    feeAmount: "0", // Fee is taken from sellAmount in modern COW
+    feeAmount: "0",
     kind: OrderKind.SELL,
     partiallyFillable: false,
-    sellTokenBalance: "erc20",
-    buyTokenBalance: "erc20",
+    sellTokenBalance: SellTokenSource.ERC20,
+    buyTokenBalance: BuyTokenDestination.ERC20,
   };
 
   // Sign the order using viem directly with EIP712
+  // Cast message to any because viem's types are stricter than what EIP712 actually requires
   const signature = await signTypedData({
-    privateKey: params.depositPrivateKey,
+    privateKey: params.vaultPrivateKey,
     domain: getCowDomain(params.chainId),
     types: COW_ORDER_TYPES,
     primaryType: "Order",
-    message: order,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    message: orderMessage as any,
   });
 
   // Upload the full appData to COW's API so they know about the hooks
@@ -248,7 +272,18 @@ export async function createSwapOrderWithAppData(
 
   // Submit the order
   const orderId = await orderBookApi.sendOrder({
-    ...order,
+    sellToken: params.sellToken,
+    buyToken: params.buyToken,
+    receiver: params.receiver,
+    sellAmount: params.sellAmount,
+    buyAmount: params.buyAmountMin,
+    validTo,
+    appData: params.appDataHex,
+    feeAmount: "0",
+    kind: OrderKind.SELL,
+    partiallyFillable: false,
+    sellTokenBalance: SellTokenSource.ERC20,
+    buyTokenBalance: BuyTokenDestination.ERC20,
     signature,
     signingScheme: SigningScheme.EIP712,
     from: account.address,

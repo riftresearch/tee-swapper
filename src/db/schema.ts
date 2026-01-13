@@ -15,11 +15,10 @@ export const swaps = pgTable(
   {
     swapId: text("swap_id").primaryKey(),
     chainId: integer("chain_id").notNull(),
-    depositAddress: text("deposit_address").notNull().unique(),
-    depositPrivateKey: text("deposit_private_key").notNull(),
+    vaultAddress: text("vault_address").notNull().unique(),
+    vaultSalt: text("vault_salt").notNull(),  // Salt for deriving private key (not the key itself)
     sellToken: text("sell_token").notNull(),
     buyToken: text("buy_token").notNull(),
-    expectedAmount: text("expected_amount").notNull(),
     recipientAddress: text("recipient_address").notNull(),
     refundAddress: text("refund_address").notNull(),
     status: swapStatusEnum("status").notNull().default("pending_deposit"),
@@ -47,8 +46,11 @@ export const swaps = pgTable(
     updatedAt: timestamp("updated_at").defaultNow().notNull(),
   },
   (table) => [
-    index("idx_pending_by_chain").on(table.chainId, table.status),
-    index("idx_deposit_address").on(table.depositAddress),
+    // Composite index for getPendingSwaps: WHERE chainId = ? AND status = ? AND expiresAt > now()
+    index("idx_pending_by_chain_expires").on(table.chainId, table.status, table.expiresAt),
+    index("idx_vault_address").on(table.vaultAddress),
+    // Index for settlement poller: WHERE status = 'executing'
+    index("idx_status").on(table.status),
   ]
 );
 

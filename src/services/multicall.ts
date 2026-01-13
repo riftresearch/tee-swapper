@@ -4,13 +4,20 @@ import {
   erc20Abi,
   getContract,
 } from "viem";
-import { isNativeToken, type Token, type TokenAddress } from "../types";
+import type { Token } from "../types";
+import { getTokenAddress, isEtherToken } from "../types";
 import { deserializeToken } from "../utils/token";
 import type { Swap } from "../db/schema";
+
+// Maximum addresses to query in a single multicall
+const MULTICALL_BATCH_SIZE = 7500;
 
 /**
  * Batch get balances for multiple swaps using multicall
  * Returns balances in the same order as input swaps
+ *
+ * Automatically chunks into batches of MULTICALL_BATCH_SIZE to avoid
+ * RPC limits and timeouts.
  */
 export async function batchGetBalances(
   client: PublicClient,
@@ -18,63 +25,37 @@ export async function batchGetBalances(
 ): Promise<bigint[]> {
   if (swaps.length === 0) return [];
 
-  // Separate native ETH and ERC20 swaps
-  const ethSwaps: { index: number; swap: Swap }[] = [];
-  const erc20Swaps: { index: number; swap: Swap }[] = [];
+  const results: bigint[] = [];
 
-  swaps.forEach((swap, index) => {
-    const sellToken = deserializeToken(swap.sellToken);
-    if (isNativeToken(sellToken)) {
-      ethSwaps.push({ index, swap });
-    } else {
-      erc20Swaps.push({ index, swap });
-    }
-  });
+  // Process in chunks to avoid RPC limits
+  for (let i = 0; i < swaps.length; i += MULTICALL_BATCH_SIZE) {
+    const chunk = swaps.slice(i, i + MULTICALL_BATCH_SIZE);
 
-  // Initialize results array
-  const results: bigint[] = new Array(swaps.length).fill(0n);
-
-  // Fetch ETH balances
-  if (ethSwaps.length > 0) {
-    const ethBalances = await Promise.all(
-      ethSwaps.map(({ swap }) =>
-        client.getBalance({ address: swap.depositAddress as Address })
-      )
-    );
-    ethSwaps.forEach(({ index }, i) => {
-      const balance = ethBalances[i];
-      results[index] = balance ?? 0n;
-    });
-  }
-
-  // Fetch ERC20 balances via multicall
-  if (erc20Swaps.length > 0) {
-    const contracts = erc20Swaps.map(({ swap }) => {
+    const contracts = chunk.map((swap) => {
       const sellToken = deserializeToken(swap.sellToken);
-      // Safe to access .address since we filtered native ETH above
-      const tokenAddress = isNativeToken(sellToken) ? null : sellToken.address;
+      if (isEtherToken(sellToken)) {
+        throw new Error("Ether token not supported for balanceOf");
+      }
       return {
-        address: tokenAddress as Address,
+        address: getTokenAddress(sellToken) as Address,
         abi: erc20Abi,
         functionName: "balanceOf" as const,
-        args: [swap.depositAddress as Address] as const,
+        args: [swap.vaultAddress as Address] as const,
       };
     });
 
-    const erc20Results = await client.multicall({
+    const chunkResults = await client.multicall({
       contracts,
       allowFailure: true,
     });
 
-    erc20Swaps.forEach(({ index }, i) => {
-      const result = erc20Results[i];
+    for (const result of chunkResults) {
       if (result && result.status === "success") {
-        results[index] = result.result as bigint;
+        results.push(result.result as bigint);
       } else {
-        // If call failed, balance is 0
-        results[index] = 0n;
+        results.push(0n);
       }
-    });
+    }
   }
 
   return results;
@@ -88,12 +69,8 @@ export async function getBalance(
   address: Address,
   token: Token
 ): Promise<bigint> {
-  if (isNativeToken(token)) {
-    return client.getBalance({ address });
-  }
-
   const contract = getContract({
-    address: token.address,
+    address: getTokenAddress(token) as Address,
     abi: erc20Abi,
     client,
   });

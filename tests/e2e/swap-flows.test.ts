@@ -2,8 +2,11 @@
  * End-to-end integration tests for swap flows on Base chain.
  *
  * These tests use real blockchain transactions and require:
- * - TEST_PRIVATE_KEY in .env (funded account with ETH, USDC, USDT on Base)
+ * - TEST_PRIVATE_KEY in .env (funded account with CBBTC on Base)
  * - BASE_RPC_URL in .env (or uses default public RPC)
+ *
+ * All swaps sell CBBTC using the EIP-2612 permit flow (gasless approvals).
+ * CBBTC is the only supported input token.
  *
  * Run with: bun test tests/e2e/swap-flows.test.ts
  */
@@ -27,25 +30,24 @@ import { initCowSdkAdapter } from "../../src/services/cowswap-adapter";
 import { setupPersistentTestDatabase } from "./db-persistent";
 import type { CreateSwapResponse, SwapStatusResponse, QuoteResponse } from "../../src/types";
 
-// Base chain token addresses (raw addresses for balance checks and transfers)
+// Base chain token addresses for ERC20 tokens
 const TOKEN_ADDRESSES = {
-  ETH: "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE" as const,
+  CBBTC: "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf" as const,
+  WETH: "0x4200000000000000000000000000000000000006" as const,
   USDC: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const,
-  USDT: "0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2" as const,
 } as const;
 
-// Token objects for API requests (tagged union format)
+// Token objects for API requests (buyToken only - sellToken is always CBBTC)
 const TOKENS = {
-  ETH: { type: "native" as const },
+  ETH: { type: "ether" as const },  // Native ETH (not WETH)
+  WETH: { type: "erc20" as const, address: TOKEN_ADDRESSES.WETH },
   USDC: { type: "erc20" as const, address: TOKEN_ADDRESSES.USDC },
-  USDT: { type: "erc20" as const, address: TOKEN_ADDRESSES.USDT },
 } as const;
 
 // Test amounts
 const TEST_AMOUNTS = {
-  ETH: parseUnits("0.003", 18),   // 0.003 ETH
-  USDC: parseUnits("9", 6),       // 9 USDC
-  USDT: parseUnits("3", 6),       // 3 USDT (reduced - legacy flow expected to fail anyway)
+  CBBTC_QUOTE: parseUnits("0.0002", 8),  // 0.0002 CBBTC - amount used for quote
+  CBBTC_DEPOSIT: parseUnits("0.0001", 8), // 0.0001 CBBTC - amount actually deposited (different from quote)
 } as const;
 
 // Polling configuration
@@ -115,10 +117,6 @@ async function getTokenBalance(
   token: Address,
   account: Address
 ): Promise<bigint> {
-  if (token.toLowerCase() === TOKEN_ADDRESSES.ETH.toLowerCase()) {
-    return client.getBalance({ address: account });
-  }
-
   return client.readContract({
     address: token,
     abi: erc20Abi,
@@ -140,19 +138,6 @@ async function sendTokens(
   const account = walletClient.account;
   if (!account) throw new Error("Wallet client has no account");
 
-  if (token.toLowerCase() === TOKEN_ADDRESSES.ETH.toLowerCase()) {
-    // Send native ETH
-    const hash = await walletClient.sendTransaction({
-      account,
-      chain: base,
-      to,
-      value: amount,
-    });
-    await publicClient.waitForTransactionReceipt({ hash });
-    return hash;
-  }
-
-  // Send ERC20
   const hash = await walletClient.writeContract({
     account,
     chain: base,
@@ -196,19 +181,13 @@ describe("E2E Swap Flows (Base Chain)", () => {
 
     console.log(`[Setup] Test account: ${testAccount}`);
 
-    // Check balances
-    const ethBalance = await getTokenBalance(publicClient, TOKEN_ADDRESSES.ETH, testAccount);
-    const usdcBalance = await getTokenBalance(publicClient, TOKEN_ADDRESSES.USDC, testAccount);
+    // Check CBBTC balance
+    const cbbtcBalance = await getTokenBalance(publicClient, TOKEN_ADDRESSES.CBBTC, testAccount);
+    console.log(`[Setup] CBBTC balance: ${formatUnits(cbbtcBalance, 8)} CBBTC`);
 
-    console.log(`[Setup] ETH balance: ${formatUnits(ethBalance, 18)} ETH`);
-    console.log(`[Setup] USDC balance: ${formatUnits(usdcBalance, 6)} USDC`);
-
-    // Validate sufficient balances
-    if (ethBalance < TEST_AMOUNTS.ETH + parseUnits("0.01", 18)) {
-      throw new Error("Insufficient ETH balance for tests (need 0.003 + gas)");
-    }
-    if (usdcBalance < TEST_AMOUNTS.USDC) {
-      throw new Error("Insufficient USDC balance for tests");
+    // Validate sufficient balance
+    if (cbbtcBalance < TEST_AMOUNTS.CBBTC_DEPOSIT) {
+      throw new Error("Insufficient CBBTC balance for tests");
     }
 
     // Initialize COW SDK adapter
@@ -234,216 +213,140 @@ describe("E2E Swap Flows (Base Chain)", () => {
     console.log("[Teardown] Database retained at ./test-data/pglite/ for inspection");
   });
 
-  describe("ETH -> USDC (EthFlow)", () => {
-    it("swaps native ETH for USDC via EthFlow contract", async () => {
-      const sellAmount = TEST_AMOUNTS.ETH.toString();
+  describe("CBBTC -> USDC (Permit Flow)", () => {
+    it("swaps CBBTC for USDC via EIP-2612 permit", async () => {
+      // Quote for a LARGER amount than we'll actually deposit
+      // This tests that the swap executes for the deposited amount, not the quoted amount
+      const quoteAmount = TEST_AMOUNTS.CBBTC_QUOTE.toString();
+      const depositAmount = TEST_AMOUNTS.CBBTC_DEPOSIT;
 
-      // 1. Get quote
-      console.log("[ETH->USDC] Getting quote...");
+      // 1. Get quote for the larger amount (informational only)
+      console.log(`[CBBTC->USDC] Getting quote for ${formatUnits(TEST_AMOUNTS.CBBTC_QUOTE, 8)} CBBTC...`);
       const quoteResponse = await request(app, "/quote", {
         method: "POST",
         body: {
-          chainId: 8453, // Base
-          sellToken: TOKENS.ETH,
+          chainId: 8453,
           buyToken: TOKENS.USDC,
-          sellAmount,
+          sellAmount: quoteAmount,
         },
       });
       expect(quoteResponse.status).toBe(200);
       const quote = (await quoteResponse.json()) as QuoteResponse;
-      console.log(`[ETH->USDC] Quote: ${formatUnits(BigInt(quote.buyAmountEstimate), 6)} USDC`);
+      console.log(`[CBBTC->USDC] Quote: ${formatUnits(BigInt(quote.buyAmountEstimate), 6)} USDC (for ${formatUnits(TEST_AMOUNTS.CBBTC_QUOTE, 8)} CBBTC)`);
 
-      // 2. Create swap
-      console.log("[ETH->USDC] Creating swap...");
+      // 2. Create swap (amount will be determined by actual deposit, not quote)
+      console.log("[CBBTC->USDC] Creating swap...");
       const createResponse = await request(app, "/swap", {
         method: "POST",
         body: {
           chainId: 8453,
-          sellToken: TOKENS.ETH,
           buyToken: TOKENS.USDC,
-          sellAmount,
           recipientAddress: testAccount,
           refundAddress: testAccount,
         },
       });
       expect(createResponse.status).toBe(200);
       const swap = (await createResponse.json()) as CreateSwapResponse;
-      console.log(`[ETH->USDC] Swap created: ${swap.swapId}`);
-      console.log(`[ETH->USDC] Deposit address: ${swap.depositAddress}`);
+      console.log(`[CBBTC->USDC] Swap created: ${swap.swapId}`);
+      console.log(`[CBBTC->USDC] Vault address: ${swap.vaultAddress}`);
 
       // 3. Record initial USDC balance
       const initialUsdcBalance = await getTokenBalance(publicClient, TOKEN_ADDRESSES.USDC, testAccount);
-      console.log(`[ETH->USDC] Initial USDC balance: ${formatUnits(initialUsdcBalance, 6)}`);
+      console.log(`[CBBTC->USDC] Initial USDC balance: ${formatUnits(initialUsdcBalance, 6)}`);
 
-      // 4. Send ETH to deposit address
-      console.log("[ETH->USDC] Sending ETH to deposit address...");
+      // 4. Send SMALLER amount than quoted - swap should still work for deposited amount
+      console.log(`[CBBTC->USDC] Sending ${formatUnits(depositAmount, 8)} CBBTC to vault (less than quoted)...`);
       const txHash = await sendTokens(
         walletClient,
         publicClient,
-        TOKEN_ADDRESSES.ETH,
-        swap.depositAddress as Address,
-        BigInt(sellAmount)
+        TOKEN_ADDRESSES.CBBTC,
+        swap.vaultAddress as Address,
+        depositAmount
       );
-      console.log(`[ETH->USDC] Deposit tx: ${txHash}`);
+      console.log(`[CBBTC->USDC] Deposit tx: ${txHash}`);
 
       // 5. Poll until complete
-      console.log("[ETH->USDC] Polling for completion...");
+      console.log("[CBBTC->USDC] Polling for completion...");
       const finalStatus = await pollUntilComplete(app, swap.swapId);
       expect(finalStatus.status).toBe("complete");
       expect(finalStatus.settlementTxHash).toBeDefined();
-      console.log(`[ETH->USDC] Settlement tx: ${finalStatus.settlementTxHash}`);
+      console.log(`[CBBTC->USDC] Settlement tx: ${finalStatus.settlementTxHash}`);
 
       // 6. Verify USDC balance increased
       const finalUsdcBalance = await getTokenBalance(publicClient, TOKEN_ADDRESSES.USDC, testAccount);
-      console.log(`[ETH->USDC] Final USDC balance: ${formatUnits(finalUsdcBalance, 6)}`);
+      console.log(`[CBBTC->USDC] Final USDC balance: ${formatUnits(finalUsdcBalance, 6)}`);
       expect(finalUsdcBalance).toBeGreaterThan(initialUsdcBalance);
 
       const received = finalUsdcBalance - initialUsdcBalance;
-      console.log(`[ETH->USDC] Received: ${formatUnits(received, 6)} USDC`);
-    }, 360_000); // 6 minute timeout
+      console.log(`[CBBTC->USDC] Received: ${formatUnits(received, 6)} USDC`);
+    }, 360_000);
   });
 
-  describe("USDC -> ETH (Permit Flow)", () => {
-    it("swaps USDC for ETH via permit", async () => {
-      const sellAmount = TEST_AMOUNTS.USDC.toString();
+  describe("CBBTC -> Native ETH (Permit Flow)", () => {
+    it("swaps CBBTC for native ETH via EIP-2612 permit", async () => {
+      // Quote for a LARGER amount than we'll actually deposit
+      const quoteAmount = TEST_AMOUNTS.CBBTC_QUOTE.toString();
+      const depositAmount = TEST_AMOUNTS.CBBTC_DEPOSIT;
 
-      // 1. Get quote
-      console.log("[USDC->ETH] Getting quote...");
+      // 1. Get quote for the larger amount (informational only)
+      console.log(`[CBBTC->ETH] Getting quote for ${formatUnits(TEST_AMOUNTS.CBBTC_QUOTE, 8)} CBBTC...`);
       const quoteResponse = await request(app, "/quote", {
         method: "POST",
         body: {
           chainId: 8453,
-          sellToken: TOKENS.USDC,
           buyToken: TOKENS.ETH,
-          sellAmount,
+          sellAmount: quoteAmount,
         },
       });
       expect(quoteResponse.status).toBe(200);
       const quote = (await quoteResponse.json()) as QuoteResponse;
-      console.log(`[USDC->ETH] Quote: ${formatUnits(BigInt(quote.buyAmountEstimate), 18)} ETH`);
+      console.log(`[CBBTC->ETH] Quote: ${formatUnits(BigInt(quote.buyAmountEstimate), 18)} ETH (for ${formatUnits(TEST_AMOUNTS.CBBTC_QUOTE, 8)} CBBTC)`);
 
-      // 2. Create swap
-      console.log("[USDC->ETH] Creating swap...");
+      // 2. Create swap (amount will be determined by actual deposit, not quote)
+      console.log("[CBBTC->ETH] Creating swap...");
       const createResponse = await request(app, "/swap", {
         method: "POST",
         body: {
           chainId: 8453,
-          sellToken: TOKENS.USDC,
           buyToken: TOKENS.ETH,
-          sellAmount,
           recipientAddress: testAccount,
           refundAddress: testAccount,
         },
       });
       expect(createResponse.status).toBe(200);
       const swap = (await createResponse.json()) as CreateSwapResponse;
-      console.log(`[USDC->ETH] Swap created: ${swap.swapId}`);
-      console.log(`[USDC->ETH] Deposit address: ${swap.depositAddress}`);
+      console.log(`[CBBTC->ETH] Swap created: ${swap.swapId}`);
+      console.log(`[CBBTC->ETH] Vault address: ${swap.vaultAddress}`);
 
-      // 3. Record initial ETH balance
-      const initialEthBalance = await getTokenBalance(publicClient, TOKEN_ADDRESSES.ETH, testAccount);
-      console.log(`[USDC->ETH] Initial ETH balance: ${formatUnits(initialEthBalance, 18)}`);
+      // 3. Record initial ETH balance (native ETH, not WETH)
+      const initialEthBalance: bigint = await publicClient.getBalance({ address: testAccount });
+      console.log(`[CBBTC->ETH] Initial ETH balance: ${formatUnits(initialEthBalance, 18)}`);
 
-      // 4. Send USDC to deposit address
-      console.log("[USDC->ETH] Sending USDC to deposit address...");
+      // 4. Send SMALLER amount than quoted - swap should still work for deposited amount
+      console.log(`[CBBTC->ETH] Sending ${formatUnits(depositAmount, 8)} CBBTC to vault (less than quoted)...`);
       const txHash = await sendTokens(
         walletClient,
         publicClient,
-        TOKEN_ADDRESSES.USDC,
-        swap.depositAddress as Address,
-        BigInt(sellAmount)
+        TOKEN_ADDRESSES.CBBTC,
+        swap.vaultAddress as Address,
+        depositAmount
       );
-      console.log(`[USDC->ETH] Deposit tx: ${txHash}`);
+      console.log(`[CBBTC->ETH] Deposit tx: ${txHash}`);
 
       // 5. Poll until complete
-      console.log("[USDC->ETH] Polling for completion...");
+      console.log("[CBBTC->ETH] Polling for completion...");
       const finalStatus = await pollUntilComplete(app, swap.swapId);
       expect(finalStatus.status).toBe("complete");
       expect(finalStatus.settlementTxHash).toBeDefined();
-      console.log(`[USDC->ETH] Settlement tx: ${finalStatus.settlementTxHash}`);
+      console.log(`[CBBTC->ETH] Settlement tx: ${finalStatus.settlementTxHash}`);
 
-      // 6. Log final balances (swap completed successfully - gas costs may exceed small swap amounts)
-      const finalEthBalance = await getTokenBalance(publicClient, TOKEN_ADDRESSES.ETH, testAccount);
-      console.log(`[USDC->ETH] Final ETH balance: ${formatUnits(finalEthBalance, 18)}`);
+      // 6. Verify ETH balance increased (native ETH, not WETH)
+      const finalEthBalance: bigint = await publicClient.getBalance({ address: testAccount });
+      console.log(`[CBBTC->ETH] Final ETH balance: ${formatUnits(finalEthBalance, 18)}`);
+      expect(finalEthBalance).toBeGreaterThan(initialEthBalance);
 
-      // Note: For small swaps, the gas cost of depositing USDC may exceed the ETH received
-      // The important thing is that the swap completed and settlement occurred
-      const netChange = finalEthBalance - initialEthBalance;
-      console.log(`[USDC->ETH] Net ETH change: ${formatUnits(netChange, 18)} ETH (includes gas costs)`);
+      const received = finalEthBalance - initialEthBalance;
+      console.log(`[CBBTC->ETH] Received: ${formatUnits(received, 18)} ETH (native)`);
     }, 360_000);
   });
-
-  // USDT test commented out - legacy flow not implemented, just wastes funds
-  // describe("USDT -> ETH (Legacy Flow)", () => {
-  //   it("swaps USDT for ETH (expected to fail - legacy flow not implemented)", async () => {
-  //     const sellAmount = TEST_AMOUNTS.USDT.toString();
-  //
-  //     // 1. Get quote
-  //     console.log("[USDT->ETH] Getting quote...");
-  //     const quoteResponse = await request(app, "/quote", {
-  //       method: "POST",
-  //       body: {
-  //         chainId: 8453,
-  //         sellToken: TOKENS.USDT,
-  //         buyToken: TOKENS.ETH,
-  //         sellAmount,
-  //       },
-  //     });
-  //     expect(quoteResponse.status).toBe(200);
-  //     const quote = (await quoteResponse.json()) as QuoteResponse;
-  //     console.log(`[USDT->ETH] Quote: ${formatUnits(BigInt(quote.buyAmountEstimate), 18)} ETH`);
-  //
-  //     // 2. Create swap
-  //     console.log("[USDT->ETH] Creating swap...");
-  //     const createResponse = await request(app, "/swap", {
-  //       method: "POST",
-  //       body: {
-  //         chainId: 8453,
-  //         sellToken: TOKENS.USDT,
-  //         buyToken: TOKENS.ETH,
-  //         sellAmount,
-  //         recipientAddress: testAccount,
-  //         refundAddress: testAccount,
-  //       },
-  //     });
-  //     expect(createResponse.status).toBe(200);
-  //     const swap = (await createResponse.json()) as CreateSwapResponse;
-  //     console.log(`[USDT->ETH] Swap created: ${swap.swapId}`);
-  //     console.log(`[USDT->ETH] Deposit address: ${swap.depositAddress}`);
-  //
-  //     // 3. Send USDT to deposit address
-  //     console.log("[USDT->ETH] Sending USDT to deposit address...");
-  //     const txHash = await sendTokens(
-  //       walletClient,
-  //       publicClient,
-  //       TOKENS.USDT,
-  //       swap.depositAddress as Address,
-  //       BigInt(sellAmount)
-  //     );
-  //     console.log(`[USDT->ETH] Deposit tx: ${txHash}`);
-  //
-  //     // 4. Poll - expect failure since legacy flow is not implemented
-  //     // The permit flow will try first, and if USDT doesn't support permits,
-  //     // it will fall back to legacy which throws UnsupportedTokenError
-  //     console.log("[USDT->ETH] Polling for status (expecting failure)...");
-  //
-  //     // Give it some time for the poller to pick up and process
-  //     await new Promise((resolve) => setTimeout(resolve, 15_000));
-  //
-  //     const statusResponse = await request(app, `/swap/${swap.swapId}`);
-  //     const status = (await statusResponse.json()) as SwapStatusResponse;
-  //
-  //     console.log(`[USDT->ETH] Final status: ${status.status}`);
-  //
-  //     // This test documents expected behavior - USDT swap should fail
-  //     // because legacy flow is not implemented
-  //     // If USDT supports permits on Base, this will actually succeed!
-  //     if (status.status === "complete") {
-  //       console.log("[USDT->ETH] Unexpected success! USDT may support permits on Base.");
-  //     } else {
-  //       console.log("[USDT->ETH] Failed as expected - legacy flow not implemented");
-  //       expect(status.status).toBe("failed");
-  //     }
-  //   }, 120_000);
-  // });
 });

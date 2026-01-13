@@ -1,17 +1,55 @@
-import { getExecutingSwaps, updateCowOrderStatus } from "../db/queries";
+import {
+  getExecutingSwaps,
+  updateCowOrderStatus,
+  markExpiredSwaps,
+  getSwapCountsByStatusAndChain,
+} from "../db/queries";
 import { getOrderStatus, getOrderTrades } from "./cowswap";
+import {
+  updateActiveSwapCounts,
+  recordSwapCompleted,
+  recordCowswapError,
+} from "./metrics";
 import type { SupportedChainId } from "../types";
 
 // Poll every 30 seconds for order settlement
 const SETTLEMENT_POLL_INTERVAL_MS = 30_000;
+
+/**
+ * Mark any expired swaps (pending_deposit past expiresAt)
+ * Called each poll cycle for housekeeping
+ */
+async function processExpiredSwaps(): Promise<void> {
+  const expiredCount = await markExpiredSwaps();
+  if (expiredCount > 0) {
+    console.log(`[Settlement] Marked ${expiredCount} swap(s) as expired`);
+  }
+}
+
+/**
+ * Update Prometheus metrics for active swap counts
+ */
+async function updateMetrics(): Promise<void> {
+  try {
+    const counts = await getSwapCountsByStatusAndChain();
+    updateActiveSwapCounts(counts);
+  } catch (error) {
+    console.error("[Settlement] Error updating metrics:", error);
+  }
+}
 
 // Store the poller interval
 let settlementInterval: ReturnType<typeof setInterval> | null = null;
 
 /**
  * Poll all executing swaps for settlement status updates
+ * Also handles housekeeping: marking expired swaps, updating metrics
  */
 export async function pollSettlements(): Promise<void> {
+  // Housekeeping: mark expired swaps and update metrics
+  await processExpiredSwaps();
+  await updateMetrics();
+
   const executingSwaps = await getExecutingSwaps();
 
   if (executingSwaps.length === 0) {
@@ -57,9 +95,13 @@ export async function pollSettlements(): Promise<void> {
           executedBuyAmount
         );
 
+        // Record metrics: completed swap and duration
+        const durationSeconds = (Date.now() - swap.createdAt.getTime()) / 1000;
+        recordSwapCompleted(swap.chainId, durationSeconds);
+
         console.log(
           `[Settlement] Swap ${swap.swapId} COMPLETE! ` +
-            `Buy amount: ${executedBuyAmount}, Tx: ${settlementTxHash}`
+            `Buy amount: ${executedBuyAmount}, Tx: ${settlementTxHash}, Duration: ${durationSeconds.toFixed(1)}s`
         );
       } else if (status === "EXPIRED" || status === "CANCELLED") {
         await updateCowOrderStatus(swap.swapId, status);
@@ -76,6 +118,7 @@ export async function pollSettlements(): Promise<void> {
     } catch (error) {
       // Log error but continue with other swaps
       console.error(`[Settlement] Error checking swap ${swap.swapId}:`, error);
+      recordCowswapError(swap.chainId, "getOrderStatus");
     }
   }
 }
