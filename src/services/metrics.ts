@@ -6,6 +6,8 @@ import {
   collectDefaultMetrics,
 } from "prom-client";
 import { pushTimeseries, type Timeseries } from "prometheus-remote-write";
+import { sql } from "drizzle-orm";
+import { getDb } from "../db/client";
 
 // Metric type constants (prom-client doesn't export the MetricType enum at runtime)
 const METRIC_TYPE_COUNTER = "counter";
@@ -91,6 +93,22 @@ export const cowswapApiErrorsTotal = new Counter({
 });
 
 // =============================================================================
+// Database Metrics
+// =============================================================================
+
+export const databaseSizeBytes = new Gauge({
+  name: "database_size_bytes",
+  help: "Size of the PostgreSQL database in bytes",
+  registers: [registry],
+});
+
+export const swapsTableRowCount = new Gauge({
+  name: "swaps_table_row_count",
+  help: "Total number of rows in the swaps table",
+  registers: [registry],
+});
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -159,6 +177,41 @@ export function updateActiveSwapCounts(
       { chain_id: chainId.toString(), status },
       count
     );
+  }
+}
+
+/**
+ * Update database metrics (size and row counts)
+ * Queries PostgreSQL for current database stats
+ */
+export async function updateDatabaseMetrics(): Promise<void> {
+  try {
+    const db = getDb();
+
+    // Query database size and swap count in parallel
+    const [sizeResult, countResult] = await Promise.all([
+      db.execute(sql`SELECT pg_database_size(current_database()) as size`),
+      db.execute(sql`SELECT COUNT(*) as count FROM swaps`),
+    ]);
+
+    // Update database size
+    if (sizeResult.length > 0 && sizeResult[0] && typeof sizeResult[0].size === 'string') {
+      const sizeBytes = parseInt(sizeResult[0].size, 10);
+      if (!isNaN(sizeBytes)) {
+        databaseSizeBytes.set(sizeBytes);
+      }
+    }
+
+    // Update swaps row count
+    if (countResult.length > 0 && countResult[0] && typeof countResult[0].count === 'string') {
+      const count = parseInt(countResult[0].count, 10);
+      if (!isNaN(count)) {
+        swapsTableRowCount.set(count);
+      }
+    }
+  } catch (error) {
+    // Log but don't throw - these are nice-to-have metrics
+    console.error("[Metrics] Failed to update database metrics:", error);
   }
 }
 
@@ -251,6 +304,9 @@ async function pushMetricsToGrafanaCloud(): Promise<void> {
   }
 
   try {
+    // Update database metrics before pushing
+    await updateDatabaseMetrics();
+
     const timeseries = await getTimeseries();
 
     if (timeseries.length === 0) {
