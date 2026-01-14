@@ -41,7 +41,7 @@ s *args:
 
 phala-deploy:
     # stop the app first, otherwise the deploy command will just shutoff the machine and stop the app
-    -phala cvms stop app_8f4537ca-8784-426f-be7b-26fe1e2db9e4
+    -phala cvms stop app_14db139e5a579d7bedab7796ecc435a111f10622
     sleep 3
     phala deploy --uuid 502684ff-c3ca-4539-b832-af420a598421 -c etc/compose.phala.yml -e .env.prod
 

@@ -5,7 +5,6 @@ import {
   Histogram,
   collectDefaultMetrics,
 } from "prom-client";
-import { pushTimeseries, type Timeseries } from "prometheus-remote-write";
 import { sql } from "drizzle-orm";
 import { getDb } from "../db/client";
 
@@ -21,13 +20,13 @@ export const registry = new Registry();
 collectDefaultMetrics({ register: registry });
 
 // =============================================================================
-// Grafana Cloud Remote Write Configuration
+// Grafana Cloud OTLP Configuration
 // =============================================================================
 
 interface GrafanaCloudConfig {
-  url: string;
-  username: string;
-  password: string;
+  host: string;       // e.g., https://otlp-gateway-prod-us-east-3.grafana.net
+  instanceId: string; // Grafana Cloud instance ID
+  apiKey: string;     // Grafana Cloud API key
 }
 
 let grafanaCloudConfig: GrafanaCloudConfig | null = null;
@@ -216,87 +215,143 @@ export async function updateDatabaseMetrics(): Promise<void> {
 }
 
 // =============================================================================
-// Grafana Cloud Remote Write
+// Grafana Cloud OTLP Push
 // =============================================================================
 
 /**
- * Convert prom-client metrics to prometheus-remote-write timeseries format
+ * OTLP metric types
  */
-async function getTimeseries(): Promise<Timeseries[]> {
-  const metrics = await registry.getMetricsAsJSON();
-  const timeseries: Timeseries[] = [];
-  const now = Date.now();
+interface OtlpAttribute {
+  key: string;
+  value: { stringValue: string } | { intValue: number };
+}
 
-  for (const metric of metrics) {
+interface OtlpDataPoint {
+  timeUnixNano: string;
+  asDouble?: number;
+  asInt?: number;
+  attributes: OtlpAttribute[];
+}
+
+interface OtlpMetric {
+  name: string;
+  unit: string;
+  gauge?: { dataPoints: OtlpDataPoint[] };
+  sum?: { dataPoints: OtlpDataPoint[]; aggregationTemporality: number; isMonotonic: boolean };
+}
+
+interface OtlpPayload {
+  resourceMetrics: Array<{
+    resource: { attributes: OtlpAttribute[] };
+    scopeMetrics: Array<{
+      scope: { name: string };
+      metrics: OtlpMetric[];
+    }>;
+  }>;
+}
+
+/**
+ * Convert prom-client metrics to OTLP format
+ */
+async function buildOtlpPayload(): Promise<OtlpPayload> {
+  const promMetrics = await registry.getMetricsAsJSON();
+  const nowNs = BigInt(Date.now()) * BigInt(1_000_000);
+  const metrics: OtlpMetric[] = [];
+
+  for (const metric of promMetrics) {
     const metricName = metric.name;
-    // Cast type to string for comparison (prom-client types are strings at runtime)
     const metricType = metric.type as unknown as string;
 
-    if (metricType === METRIC_TYPE_COUNTER || metricType === METRIC_TYPE_GAUGE) {
-      // Handle counter and gauge metrics
+    if (metricType === METRIC_TYPE_GAUGE) {
+      // Gauge metrics
+      const dataPoints: OtlpDataPoint[] = [];
       for (const value of metric.values) {
-        const labels: { __name__: string; [key: string]: string } = {
-          __name__: metricName,
-        };
-        // Copy labels, converting to strings
+        const attributes: OtlpAttribute[] = [];
         if (value.labels) {
           for (const [key, val] of Object.entries(value.labels)) {
-            labels[key] = String(val);
+            attributes.push({ key, value: { stringValue: String(val) } });
           }
         }
-
-        timeseries.push({
-          labels,
-          samples: [{ value: value.value as number, timestamp: now }],
+        dataPoints.push({
+          timeUnixNano: nowNs.toString(),
+          asDouble: value.value as number,
+          attributes,
+        });
+      }
+      if (dataPoints.length > 0) {
+        metrics.push({ name: metricName, unit: "1", gauge: { dataPoints } });
+      }
+    } else if (metricType === METRIC_TYPE_COUNTER) {
+      // Counter metrics (as monotonic sum)
+      const dataPoints: OtlpDataPoint[] = [];
+      for (const value of metric.values) {
+        const attributes: OtlpAttribute[] = [];
+        if (value.labels) {
+          for (const [key, val] of Object.entries(value.labels)) {
+            attributes.push({ key, value: { stringValue: String(val) } });
+          }
+        }
+        dataPoints.push({
+          timeUnixNano: nowNs.toString(),
+          asDouble: value.value as number,
+          attributes,
+        });
+      }
+      if (dataPoints.length > 0) {
+        metrics.push({
+          name: metricName,
+          unit: "1",
+          sum: { dataPoints, aggregationTemporality: 2, isMonotonic: true },
         });
       }
     } else if (metricType === METRIC_TYPE_HISTOGRAM) {
-      // Handle histogram metrics - emit bucket, sum, and count
+      // Histogram - emit as separate gauge metrics for sum, count, buckets
       for (const value of metric.values) {
-        const baseLabels: { [key: string]: string } = {};
+        const attributes: OtlpAttribute[] = [];
         if (value.labels) {
           for (const [key, val] of Object.entries(value.labels)) {
-            baseLabels[key] = String(val);
+            attributes.push({ key, value: { stringValue: String(val) } });
           }
         }
-        // Get the metric name suffix from the value
         const valueName = (value as { metricName?: string }).metricName;
-
-        if (valueName?.endsWith("_bucket")) {
-          // Bucket metric
-          timeseries.push({
-            labels: {
-              __name__: `${metricName}_bucket`,
-              ...baseLabels,
+        if (valueName) {
+          metrics.push({
+            name: valueName,
+            unit: "1",
+            gauge: {
+              dataPoints: [{
+                timeUnixNano: nowNs.toString(),
+                asDouble: value.value as number,
+                attributes,
+              }],
             },
-            samples: [{ value: value.value as number, timestamp: now }],
-          });
-        } else if (valueName?.endsWith("_sum")) {
-          timeseries.push({
-            labels: {
-              __name__: `${metricName}_sum`,
-              ...baseLabels,
-            },
-            samples: [{ value: value.value as number, timestamp: now }],
-          });
-        } else if (valueName?.endsWith("_count")) {
-          timeseries.push({
-            labels: {
-              __name__: `${metricName}_count`,
-              ...baseLabels,
-            },
-            samples: [{ value: value.value as number, timestamp: now }],
           });
         }
       }
     }
   }
 
-  return timeseries;
+  return {
+    resourceMetrics: [
+      {
+        resource: {
+          attributes: [
+            { key: "service.name", value: { stringValue: "tee-swapper" } },
+          ],
+        },
+        scopeMetrics: [
+          {
+            scope: { name: "tee-swapper-metrics" },
+            metrics,
+          },
+        ],
+      },
+    ],
+  };
 }
 
 /**
- * Push metrics to Grafana Cloud
+ * Push metrics to Grafana Cloud via OTLP
  */
 async function pushMetricsToGrafanaCloud(): Promise<void> {
   if (!grafanaCloudConfig) {
@@ -307,46 +362,56 @@ async function pushMetricsToGrafanaCloud(): Promise<void> {
     // Update database metrics before pushing
     await updateDatabaseMetrics();
 
-    const timeseries = await getTimeseries();
+    const payload = await buildOtlpPayload();
+    const metricCount = payload.resourceMetrics[0]?.scopeMetrics[0]?.metrics.length ?? 0;
 
-    if (timeseries.length === 0) {
+    if (metricCount === 0) {
       return;
     }
 
-    await pushTimeseries(timeseries, {
-      url: grafanaCloudConfig.url,
+    const authPair = `${grafanaCloudConfig.instanceId}:${grafanaCloudConfig.apiKey}`;
+    const encoded = Buffer.from(authPair).toString("base64");
+
+    const url = `${grafanaCloudConfig.host}/otlp/v1/metrics`;
+    const response = await fetch(url, {
+      method: "POST",
       headers: {
-        Authorization: `Basic ${Buffer.from(
-          `${grafanaCloudConfig.username}:${grafanaCloudConfig.password}`
-        ).toString("base64")}`,
+        "Content-Type": "application/json",
+        Authorization: `Basic ${encoded}`,
       },
+      body: JSON.stringify(payload),
     });
+
+    if (!response.ok) {
+      const body = await response.text();
+      console.error(`[Metrics] Push failed (${response.status}): ${body}`);
+    }
   } catch (error) {
     console.error("[Metrics] Failed to push to Grafana Cloud:", error);
   }
 }
 
 /**
- * Start pushing metrics to Grafana Cloud
+ * Start pushing metrics to Grafana Cloud via OTLP
  *
  * Reads configuration from environment variables:
- * - GRAFANA_CLOUD_URL: Remote write URL (e.g., https://prometheus-prod-XX-prod.grafana.net/api/prom/push)
- * - GRAFANA_CLOUD_USERNAME: Grafana Cloud user ID
+ * - GRAFANA_CLOUD_URL: OTLP gateway host (e.g., https://otlp-gateway-prod-us-east-3.grafana.net)
+ * - GRAFANA_CLOUD_USERNAME: Grafana Cloud instance ID
  * - GRAFANA_CLOUD_API_KEY: Grafana Cloud API key
  */
 export function startMetricsPush(): void {
-  const url = process.env.GRAFANA_CLOUD_URL;
-  const username = process.env.GRAFANA_CLOUD_USERNAME;
-  const password = process.env.GRAFANA_CLOUD_API_KEY;
+  const host = process.env.GRAFANA_CLOUD_URL;
+  const instanceId = process.env.GRAFANA_CLOUD_USERNAME;
+  const apiKey = process.env.GRAFANA_CLOUD_API_KEY;
 
-  if (!url || !username || !password) {
+  if (!host || !instanceId || !apiKey) {
     console.log(
       "[Metrics] Grafana Cloud not configured. Set GRAFANA_CLOUD_URL, GRAFANA_CLOUD_USERNAME, and GRAFANA_CLOUD_API_KEY to enable remote push."
     );
     return;
   }
 
-  grafanaCloudConfig = { url, username, password };
+  grafanaCloudConfig = { host, instanceId, apiKey };
 
   console.log(
     `[Metrics] Starting Grafana Cloud push (interval: ${METRICS_PUSH_INTERVAL_MS}ms)`
