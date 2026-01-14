@@ -1,0 +1,40 @@
+# Dependencies
+node_modules/
+
+# Test files and data
+tests/
+test-data/
+*.test.ts
+*.spec.ts
+
+# Development files
+.git/
+.gitignore
+.env
+.env.*
+*.md
+README*
+
+# Editor and IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker files (avoid recursive copying)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Build artifacts
+dist/
+*.log
+
+# Scripts and config not needed at runtime
+scripts/
+etc/
+justfile
+
+# Type definitions (bun handles these at runtime)
+*.d.ts

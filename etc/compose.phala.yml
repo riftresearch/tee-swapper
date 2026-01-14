@@ -1,0 +1,310 @@
+configs:
+  postgres-conf:
+    content: |
+      # PostgreSQL primary config (replication-ready)
+      listen_addresses = '*'
+      password_encryption = 'scram-sha-256'
+      wal_level = logical
+      max_wal_senders = 10
+      max_replication_slots = 10
+      max_logical_replication_workers = 4
+      max_sync_workers_per_subscription = 2
+      hot_standby = on
+      shared_buffers = 256MB
+      work_mem = 16MB
+      maintenance_work_mem = 128MB
+      max_connections = 256
+      log_connections = on
+      log_disconnections = on
+      log_statement = 'none'
+
+  postgres-hba:
+    content: |
+      # TYPE  DATABASE        USER            ADDRESS                 METHOD
+      local   all             all                                     scram-sha-256
+      host    all             all             127.0.0.1/32            scram-sha-256
+      host    all             all             ::1/128                 scram-sha-256
+
+      # Allow app traffic from the docker bridge (local docker network only)
+      # Note: swapper_app is the superuser and the application user
+      host    all             swapper_app     172.21.0.0/16           scram-sha-256
+
+      # Replication user access
+      # For logical replication, replicator needs both replication protocol access
+      # and database access for initial table sync and publication queries
+      host    replication     replicator      0.0.0.0/0               scram-sha-256
+      host    replication     replicator      ::0/0                   scram-sha-256
+      host    swapper_db      replicator      0.0.0.0/0               scram-sha-256
+      host    swapper_db      replicator      ::0/0                   scram-sha-256
+
+  postgres-init.sh:
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # Replica creds from env (must be set in the postgres service)
+      : "$${REPLICA_USER:?REPLICA_USER must be set}"
+      : "$${REPLICA_PASSWORD:?REPLICA_PASSWORD must be set}"
+
+      echo "Creating replication role: '$${REPLICA_USER}'"
+
+      # Note: POSTGRES_USER (swapper_app) is already created as superuser by the postgres image
+      # using the sidecar-generated password via POSTGRES_PASSWORD_FILE
+      psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<-SQL
+        DO \$\$
+        BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$${REPLICA_USER}') THEN
+            CREATE ROLE $${REPLICA_USER} LOGIN REPLICATION PASSWORD '$${REPLICA_PASSWORD}';
+          ELSE
+            ALTER ROLE $${REPLICA_USER} WITH LOGIN REPLICATION PASSWORD '$${REPLICA_PASSWORD}';
+          END IF;
+        END
+        \$\$;
+      SQL
+
+      # Ensure public schema is set up properly
+      psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<-SQL
+        CREATE SCHEMA IF NOT EXISTS public;
+
+        -- Future tables: superuser will own what it creates
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO $$POSTGRES_USER;
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO $$POSTGRES_USER;
+      SQL
+
+      # Create publication for logical replication
+      echo "Creating publication for logical replication..."
+      psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<-SQL
+        DO \$\$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'swapper_all_tables') THEN
+            CREATE PUBLICATION swapper_all_tables FOR ALL TABLES;
+            RAISE NOTICE 'Created publication: swapper_all_tables';
+          ELSE
+            RAISE NOTICE 'Publication swapper_all_tables already exists';
+          END IF;
+        END
+        \$\$;
+      SQL
+
+      # Grant read-only access to replicator for logical replication
+      echo "Granting read-only access to replication user..."
+      psql -v ON_ERROR_STOP=1 --username "$$POSTGRES_USER" --dbname "$$POSTGRES_DB" <<-SQL
+        -- Allow replicator to use the public schema
+        GRANT USAGE ON SCHEMA public TO $${REPLICA_USER};
+        
+        -- Grant SELECT on all existing tables (read-only)
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO $${REPLICA_USER};
+        
+        -- Grant SELECT on all future tables (read-only)
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO $${REPLICA_USER};
+        
+        -- Grant USAGE on sequences (needed for reading sequence values during replication)
+        GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO $${REPLICA_USER};
+        ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO $${REPLICA_USER};
+      SQL
+
+      echo "Init complete. Superuser: $$POSTGRES_USER, Replica user: $$REPLICA_USER (read-only)"
+
+  swapper-server-entrypoint:
+    content: |
+      #!/bin/sh
+      set -e
+
+      # Read database credentials from sidecar-generated secrets
+      if [ ! -f /run/postgres-secrets/app_user.txt ] || [ ! -f /run/postgres-secrets/app_password.txt ]; then
+        echo "ERROR: Database credentials not found in /run/postgres-secrets"
+        exit 1
+      fi
+
+      # Verify server key file exists (required for key derivation)
+      if [ ! -f /run/server-secrets/server_key.txt ]; then
+        echo "ERROR: Server key not found at /run/server-secrets/server_key.txt"
+        exit 1
+      fi
+
+      DB_USER=$$(cat /run/postgres-secrets/app_user.txt | tr -d '\n\r')
+      DB_PASS=$$(cat /run/postgres-secrets/app_password.txt | tr -d '\n\r')
+
+      # Construct DATABASE_URL using the generated credentials
+      # Note: password is hex-only so no URL encoding needed
+      export DATABASE_URL="postgres://$${DB_USER}:$${DB_PASS}@postgres:5432/swapper_db"
+
+      echo "Starting cbbtc-swapper-server with database user: $${DB_USER}"
+
+      # Execute the original entrypoint/command
+      exec "$@"
+
+  dozzle_users:
+    content: |
+      users:
+        admin:
+            email: cliff@rift.exchange
+            name: Cliff Syner
+            password: $$2a$$11$$KETX/yx/Y9EzmTvXGJGJxu5jZqR.nvyS3HbdV510Fc4I/KhUnT.EO
+            filter: ""
+            roles: ""
+
+services:
+  pg-secret-generator:
+    container_name: tee-swapper-pg-secret-generator
+    image: alpine:3.22.1
+    command: >
+      sh -c "
+        set -e;
+        mkdir -p /secrets;
+        # only generate once; idempotent across restarts
+        if [ ! -f /secrets/app_user.txt ]; then
+          echo 'swapper_app' > /secrets/app_user.txt;
+        fi;
+        if [ ! -f /secrets/app_password.txt ]; then
+          apk add --no-cache openssl >/dev/null;
+          openssl rand -hex 32 | tr -d '\n' > /secrets/app_password.txt;
+          echo 'Generated new app DB password';
+        else
+          echo 'App DB password already exists, skipping';
+        fi
+      "
+    volumes:
+      - swapper_pg_secrets:/secrets
+    restart: "no"
+    networks:
+      - swapper-network
+
+  server-key-generator:
+    container_name: tee-swapper-server-key-generator
+    image: alpine:3.22.1
+    command: >
+      sh -c "
+        set -e;
+        mkdir -p /secrets;
+        if [ ! -f /secrets/server_key.txt ]; then
+          apk add --no-cache openssl >/dev/null;
+          openssl rand -hex 32 | tr -d '\n' > /secrets/server_key.txt;
+          chmod 600 /secrets/server_key.txt;
+          echo 'Generated new server master key';
+        else
+          echo 'Server master key already exists, skipping';
+        fi
+      "
+    volumes:
+      - swapper_server_secrets:/secrets
+    restart: "no"
+    networks:
+      - swapper-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: tee-swapper-postgres
+    environment:
+      # Superuser (also used by the application)
+      POSTGRES_USER: swapper_app
+      POSTGRES_PASSWORD_FILE: /run/postgres-secrets/app_password.txt
+      POSTGRES_DB: swapper_db
+
+      # Replication user credentials
+      REPLICA_USER: replicator
+      REPLICA_PASSWORD: ${POSTGRES_REPLICA_PASSWORD:?set POSTGRES_REPLICA_PASSWORD}
+      # REPLICA_PASSWORD: temp_replica_user_password
+
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - swapper_postgres_data_v5:/var/lib/postgresql/data
+      - swapper_pg_secrets:/run/postgres-secrets:ro
+    configs:
+      - source: postgres-conf
+        target: /etc/postgresql/postgresql.conf
+      - source: postgres-hba
+        target: /etc/postgresql/pg_hba.conf
+      - source: postgres-init.sh
+        target: /docker-entrypoint-initdb.d/00-init.sh
+        mode: 0755
+    command:
+      - "-c"
+      - "config_file=/etc/postgresql/postgresql.conf"
+      - "-c"
+      - "hba_file=/etc/postgresql/pg_hba.conf"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    ports:
+      - "5432:5432"
+    depends_on:
+      pg-secret-generator:
+        condition: service_completed_successfully
+    networks:
+      - swapper-network
+
+  dozzle:
+    container_name: tee-swapper-dozzle
+    image: amir20/dozzle:latest
+    environment:
+      - DOZZLE_AUTH_PROVIDER=simple
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    configs:
+      - source: dozzle_users
+        target: /data/users.yml
+    ports:
+      - 8095:8080
+    networks:
+      - swapper-network
+
+  cbbtc-swapper-server:
+    image: riftresearch/cbbtc-swapper-server:0.1.0
+    restart: unless-stopped
+    container_name: tee-swapper-server
+    depends_on:
+      pg-secret-generator:
+        condition: service_completed_successfully
+      server-key-generator:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/usr/local/bin/swapper-server-entrypoint.sh"]
+    command: ["bun", "run", "/app/src/index.ts"]
+    environment:
+      GRANT_SUDO: yes
+      # DATABASE_URL is constructed dynamically in the entrypoint from pg-sidecar
+      PORT: 3000
+      # Server master key for vault key derivation
+      SERVER_KEY_PATH: /run/server-secrets/server_key.txt
+      ETH_RPC_URL: ${ETH_RPC_URL:?set ETH_RPC_URL}
+      BASE_RPC_URL: ${BASE_RPC_URL:?set BASE_RPC_URL}
+      GRAFANA_CLOUD_URL: ${GRAFANA_CLOUD_URL:?set GRAFANA_CLOUD_URL}
+      GRAFANA_CLOUD_USERNAME: ${GRAFANA_CLOUD_USERNAME:?set GRAFANA_CLOUD_USERNAME}
+      GRAFANA_CLOUD_API_KEY: ${GRAFANA_CLOUD_API_KEY:?set GRAFANA_CLOUD_API_KEY}
+      CONFIG_DIR: /app/config
+      DSTACK_SOCK_PATH: /var/run/dstack.sock
+    ports:
+      - "3000:3000"
+    expose:
+      - "3000"
+    networks:
+      - swapper-network
+    volumes:
+      - ${DSTACK_SOCK_PATH:-/var/run/dstack.sock}:/var/run/dstack.sock
+      - swapper_server_config_data:/app/config
+      - swapper_pg_secrets:/run/postgres-secrets:ro
+      - swapper_server_secrets:/run/server-secrets:ro
+    configs:
+      - source: swapper-server-entrypoint
+        target: /usr/local/bin/swapper-server-entrypoint.sh
+        mode: 0755
+    platform: linux/amd64
+    user: root
+
+networks:
+  swapper-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16
+
+volumes:
+  swapper_postgres_data_v5:
+  swapper_server_config_data:
+  swapper_pg_secrets:
+  swapper_server_secrets:

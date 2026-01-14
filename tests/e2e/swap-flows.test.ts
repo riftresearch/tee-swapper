@@ -5,10 +5,15 @@
  * - TEST_PRIVATE_KEY in .env (funded account with CBBTC on Base)
  * - BASE_RPC_URL in .env (or uses default public RPC)
  *
+ * Optional:
+ * - TEST_SERVER_URL: If set, tests run against a deployed server (e.g., http://localhost:3000)
+ *   If not set, tests spin up a local app instance with PGlite
+ *
  * All swaps sell CBBTC using the EIP-2612 permit flow (gasless approvals).
  * CBBTC is the only supported input token.
  *
- * Run with: bun test tests/e2e/swap-flows.test.ts
+ * Run locally:     bun test tests/e2e/swap-flows.test.ts
+ * Run vs server:   TEST_SERVER_URL=http://localhost:3000 bun test tests/e2e/swap-flows.test.ts
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
@@ -54,10 +59,14 @@ const TEST_AMOUNTS = {
 const POLL_INTERVAL_MS = 5_000;     // 5 seconds
 const MAX_POLL_TIME_MS = 300_000;   // 5 minutes timeout
 
-type TestApp = ReturnType<typeof createApp>;
+// Check if we're testing against a remote server
+const TEST_SERVER_URL = process.env.TEST_SERVER_URL;
+const isRemoteMode = !!TEST_SERVER_URL;
+
+type TestApp = ReturnType<typeof createApp> | null;
 
 /**
- * Helper to make requests to the test app
+ * Helper to make requests - works with both local app and remote server
  */
 async function request(
   app: TestApp,
@@ -75,7 +84,15 @@ async function request(
   if (body !== undefined) {
     requestInit.body = JSON.stringify(body);
   }
-  return app.handle(new Request(`http://localhost${path}`, requestInit));
+
+  if (isRemoteMode) {
+    // Remote server mode - use fetch
+    return fetch(`${TEST_SERVER_URL}${path}`, requestInit);
+  } else {
+    // Local app mode - use app.handle()
+    if (!app) throw new Error("App not initialized");
+    return app.handle(new Request(`http://localhost${path}`, requestInit));
+  }
 }
 
 /**
@@ -151,12 +168,19 @@ async function sendTokens(
 }
 
 describe("E2E Swap Flows (Base Chain)", () => {
-  let app: TestApp;
+  let app: TestApp = null;
   let publicClient: any;
   let walletClient: any;
   let testAccount: Address;
 
   beforeAll(async () => {
+    // Log test mode
+    if (isRemoteMode) {
+      console.log(`[Setup] Running against remote server: ${TEST_SERVER_URL}`);
+    } else {
+      console.log("[Setup] Running with local app instance");
+    }
+
     // Validate environment
     const privateKey = process.env.TEST_PRIVATE_KEY;
     if (!privateKey) {
@@ -190,27 +214,33 @@ describe("E2E Swap Flows (Base Chain)", () => {
       throw new Error("Insufficient CBBTC balance for tests");
     }
 
-    // Initialize COW SDK adapter
-    initCowSdkAdapter();
+    // Only set up local infrastructure if not in remote mode
+    if (!isRemoteMode) {
+      // Initialize COW SDK adapter
+      initCowSdkAdapter();
 
-    // Set up persistent test database (data retained for inspection)
-    await setupPersistentTestDatabase();
-    app = createApp();
+      // Set up persistent test database (data retained for inspection)
+      await setupPersistentTestDatabase();
+      app = createApp();
 
-    // Start pollers for deposit detection and settlement tracking
-    startAllPollers();
-    startSettlementPoller();
-    console.log("[Setup] Pollers started");
+      // Start pollers for deposit detection and settlement tracking
+      startAllPollers();
+      startSettlementPoller();
+      console.log("[Setup] Pollers started");
+    }
   });
 
   afterAll(async () => {
-    // Stop pollers
-    stopAllPollers();
-    stopSettlementPoller();
-    console.log("[Teardown] Pollers stopped");
+    // Only tear down if we started local infrastructure
+    if (!isRemoteMode) {
+      // Stop pollers
+      stopAllPollers();
+      stopSettlementPoller();
+      console.log("[Teardown] Pollers stopped");
 
-    // Database is NOT torn down - data persists in ./test-data/pglite/
-    console.log("[Teardown] Database retained at ./test-data/pglite/ for inspection");
+      // Database is NOT torn down - data persists in ./test-data/pglite/
+      console.log("[Teardown] Database retained at ./test-data/pglite/ for inspection");
+    }
   });
 
   describe("CBBTC -> USDC (Permit Flow)", () => {
