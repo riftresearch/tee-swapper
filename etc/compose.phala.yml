@@ -253,7 +253,7 @@ services:
       - swapper-network
 
   cbbtc-swapper-server:
-    image: riftresearch/cbbtc-swapper-server:0.4.0
+    image: riftresearch/cbbtc-swapper-server:0.6.0
     restart: unless-stopped
     container_name: tee-swapper-server
     depends_on:
