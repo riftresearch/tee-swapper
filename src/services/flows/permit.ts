@@ -181,7 +181,7 @@ async function buildAppDataWithPermitHook(
   // Build the appData document following COW Protocol appData schema v1.1.0
   const appDataDoc = {
     version: "1.1.0",
-    appCode: "Rift TEE Swapper",
+    appCode: "rift.trade",
     metadata: {
       hooks: {
         pre: [
